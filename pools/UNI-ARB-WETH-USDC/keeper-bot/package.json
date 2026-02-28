@@ -1,0 +1,15 @@
+{
+  "name": "liquid-hub-keeper-standard",
+  "version": "1.0.0",
+  "description": "Keeper bot for Liquid Hub Standard Pool (UNI-ARB-WETH-USDC)",
+  "main": "src/keeper.js",
+  "scripts": {
+    "start": "node src/keeper.js",
+    "check": "node src/keeper.js --check-only"
+  },
+  "dependencies": {
+    "ethers": "^6.9.0",
+    "dotenv": "^16.3.1"
+  },
+  "license": "BUSL-1.1"
+}
