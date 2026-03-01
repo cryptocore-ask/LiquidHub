@@ -125,6 +125,7 @@ contract RangeManager is Ownable, ReentrancyGuard {
      */
     modifier onlyAuthorized() {
         require(
+            msg.sender == address(this) ||
             msg.sender == owner() ||
             msg.sender == safeAddress ||
             authorizedExecutors[msg.sender],
@@ -173,6 +174,7 @@ contract RangeManager is Ownable, ReentrancyGuard {
 
     modifier onlyVaultOrAuthorized() {
         require(
+            msg.sender == address(this) ||
             msg.sender == vault ||
             msg.sender == owner() ||
             msg.sender == safeAddress ||

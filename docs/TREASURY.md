@@ -11,7 +11,7 @@ The on-chain Treasury contract collects protocol fees and manages fund distribut
 | Source | Tokens | Mechanism |
 |--------|--------|-----------|
 | LP commissions | WETH + USDC | Collected during each rebalance, sent from vault to Treasury |
-| Frontend swap commissions | USDC | Via DEX aggregator partner fee (`PARTNER_FEE_BPS=3`, 0.03%) |
+| Frontend swap commissions | Any ERC-20 | Via DEX aggregator partner fee (`PARTNER_FEE_BPS=3`, 0.03%) |
 
 ---
 
@@ -27,9 +27,12 @@ The on-chain Treasury contract collects protocol fees and manages fund distribut
 ## swapToUSDC()
 
 - **Public function** — anyone can call it.
-- Converts the Treasury's WETH balance to USDC via Uniswap V3.
-- Tokens remain in the Treasury after the swap.
-- Useful for consolidating revenue into a single token before distribution.
+- Converts **any ERC-20 token** held by the Treasury to USDC via Uniswap V3.
+- Takes `tokenIn` (token address), `fee` (Uniswap V3 pool fee tier), `amountIn`, and `minAmountOut` as parameters.
+- Fee tiers: 100 (0.01%), 500 (0.05%), 3000 (0.3%), 10000 (1%).
+- USDC remains in the Treasury after the swap.
+- Useful for consolidating revenue from multiple token types into USDC before distribution.
+- One Treasury per network handles all pools and frontend swap commissions on that network.
 
 ---
 

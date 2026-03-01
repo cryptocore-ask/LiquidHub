@@ -18,9 +18,7 @@ contract Treasury is Ownable {
 
     // --- Immutables ---
     IERC20 public immutable usdc;
-    IERC20 public immutable token0;
     ISwapRouter public immutable swapRouter;
-    uint24 public immutable poolFee;
     ILayerZeroEndpoint public immutable lzEndpoint;
 
     // --- State ---
@@ -46,49 +44,49 @@ contract Treasury is Ownable {
     event StakingRewardsSet(address indexed stakingRewards);
     event FeesDistributed(uint256 amount);
     event MonthlyCapUpdated(uint256 oldCap, uint256 newCap);
-    event SwappedToUSDC(address indexed tokenIn, uint256 amountIn, uint256 usdcOut);
+    event SwappedToUSDC(address indexed tokenIn, uint24 fee, uint256 amountIn, uint256 usdcOut);
     event KeeperBountyPaid(address indexed keeper, uint256 amount);
     event KeeperBountyConfigured(bool enabled, uint256 amount);
     event BridgeConfigured(bool enabled, uint16 chainId, address destination);
     event BridgedToStakers(uint256 amount, uint16 destinationChainId);
 
     constructor(
-        address _token0,
         address _usdc,
         address _swapRouter,
-        uint24 _poolFee,
         uint256 _monthlyCap,
         bool _keeperBountyEnabled,
         uint256 _keeperBountyAmount,
         address _lzEndpoint
     ) {
-        token0 = IERC20(_token0);
         usdc = IERC20(_usdc);
         swapRouter = ISwapRouter(_swapRouter);
-        poolFee = _poolFee;
         monthlyCap = _monthlyCap;
         adminWithdrawEnabled = true;
         currentMonthStart = block.timestamp;
         keeperBountyEnabled = _keeperBountyEnabled;
         keeperBountyAmount = _keeperBountyAmount;
         lzEndpoint = ILayerZeroEndpoint(_lzEndpoint);
-
-        IERC20(_token0).safeApprove(_swapRouter, type(uint256).max);
     }
 
     receive() external payable {}
 
     // --- Public Functions ---
 
-    /// @notice Swap token0 (ex: WETH) to USDC via Uniswap V3. Callable by anyone.
-    function swapToUSDC(uint256 amountIn, uint256 minAmountOut) external returns (uint256 amountOut) {
+    /// @notice Swap any ERC-20 token held by this Treasury to USDC via Uniswap V3. Callable by anyone.
+    function swapToUSDC(address tokenIn, uint24 fee, uint256 amountIn, uint256 minAmountOut) external returns (uint256 amountOut) {
+        require(tokenIn != address(usdc), "Already USDC");
         require(amountIn > 0, "Zero amount");
-        require(token0.balanceOf(address(this)) >= amountIn, "Insufficient balance");
+        IERC20 token = IERC20(tokenIn);
+        require(token.balanceOf(address(this)) >= amountIn, "Insufficient balance");
+
+        // Approve swap router for this token (safe pattern: reset then set)
+        token.safeApprove(address(swapRouter), 0);
+        token.safeApprove(address(swapRouter), amountIn);
 
         ISwapRouter.ExactInputSingleParams memory params = ISwapRouter.ExactInputSingleParams({
-            tokenIn: address(token0),
+            tokenIn: tokenIn,
             tokenOut: address(usdc),
-            fee: poolFee,
+            fee: fee,
             recipient: address(this),
             deadline: block.timestamp,
             amountIn: amountIn,
@@ -97,7 +95,7 @@ contract Treasury is Ownable {
         });
 
         amountOut = swapRouter.exactInputSingle(params);
-        emit SwappedToUSDC(address(token0), amountIn, amountOut);
+        emit SwappedToUSDC(tokenIn, fee, amountIn, amountOut);
     }
 
     // --- Admin Functions (onlyOwner = Safe) ---

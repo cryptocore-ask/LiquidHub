@@ -65,5 +65,5 @@ Large swaps are split into smaller chunks to reduce price impact on the pool:
 
 - **LP commissions** are collected on each rebalance (`TAUX_PRELEV_PRCT`, default 10% of earned fees).
 - Commissions are sent to the Treasury contract in WETH + USDC.
-- Treasury can convert WETH to USDC via `swapToUSDC()`.
-- **Frontend swap commission**: a partner fee (`PARTNER_FEE_BPS=3`, i.e. 0.03%) is applied on frontend swaps and sent directly to the Treasury.
+- Treasury can convert any ERC-20 token to USDC via `swapToUSDC(tokenIn, fee, amountIn, minAmountOut)`.
+- **Frontend swap commission**: a partner fee (`PARTNER_FEE_BPS=3`, i.e. 0.03%) is applied on frontend swaps and sent directly to the Treasury. The Treasury accepts any token received from these swaps.

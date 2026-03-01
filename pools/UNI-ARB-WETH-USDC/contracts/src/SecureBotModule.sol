@@ -53,7 +53,7 @@ contract SecureBotModule {
         allowedFunctions[0xde5aa922] = true; // configureRanges
         allowedFunctions[0x7f9dc7d2] = true; // configureSlippage
         allowedFunctions[0x19218994] = true; // setMaxPositions
-        allowedFunctions[0x5b46bffc] = true; // configureProtections
+        allowedFunctions[0x7d48e49b] = true; // configureProtections(bool,bool,bool,uint16)
         allowedFunctions[0x66231dcd] = true; // configureTolerance
 
         // Fonctions MultiUserVault
