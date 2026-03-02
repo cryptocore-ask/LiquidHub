@@ -67,9 +67,8 @@ contract SecureBotModule {
         allowedFunctions[0x0040718e] = true; // endRebalance()
         allowedFunctions[0x2a7cf2fe] = true; // addLiquidityToPosition
         allowedFunctions[0xa5993427] = true; // withdrawReservedCollateral(uint256,address) - DN hedge
-        allowedFunctions[0x8c69498d] = true; // sendTokenForHedgeRepay(address,uint256,address) - emergency WETH to hedge
-        allowedFunctions[0xcaa46ff0] = true; // EmergencyRecoverUser(address) - emergency per-user recovery
-        allowedFunctions[0x4e653e07] = true; // EmergencyBurnPositions() - emergency burn all LP positions
+        // Emergency functions (EmergencyBurnPositions, EmergencyRecoverUser, sendTokenForHedgeRepay)
+        // are NOT whitelisted here — they can only be called directly from the Safe
 
         // Fonctions AaveHedgeManager (Delta Neutral AAVE V3)
         allowedFunctions[0x39ed9306] = true; // supplyAndBorrow(uint256)

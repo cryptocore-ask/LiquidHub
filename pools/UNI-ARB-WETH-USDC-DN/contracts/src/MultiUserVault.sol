@@ -110,19 +110,9 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
     //securbotmodule
     address public botModule;
 
-    // Commissions en attente de collecte
-    uint256 public pendingCommissionToken0;
-    uint256 public pendingCommissionToken1;
-
-    // Tracking total des commissions
+    // Tracking comptable des commissions envoyees au Treasury (auto-compound)
     uint256 public totalCommissionCollectedToken0;
     uint256 public totalCommissionCollectedToken1;
-
-    // Fees utilisateurs disponibles dans le vault (collectés de Uniswap mais pas encore withdrawés)
-    // Ces fees sont trackés comptablement dans totalFeesEarnedToken0/1 par utilisateur
-    // ET physiquement disponibles comme tokens libres dans le vault
-    uint256 public totalUserFeesInVault0;
-    uint256 public totalUserFeesInVault1;
     
     mapping(address => bool) public hasPendingDeposit;
 
@@ -613,16 +603,11 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
         _updateUserFees(msg.sender);
         _handleUnclaimedFeesOnWithdraw(user, shareAmount);
 
-        // Calculer montants pour le retrait
+        // Calculer montants pour le retrait (commission = 0, deja au Treasury)
         (uint256 commission0, uint256 commission1, uint256 principal0, uint256 principal1) =
             _calculateWithdrawAmounts(shareAmount);
 
-        // Utiliser la part proportionnelle de totalUserFeesInVault
-        uint256 savedFees0 = (totalUserFeesInVault0 * vaultSharesPercent) / 10000;
-        uint256 savedFees1 = (totalUserFeesInVault1 * vaultSharesPercent) / 10000;
-
         // ===== EFFECTS =====
-        // CRITIQUE: Mettre à jour l'état AVANT les interactions externes (CEI pattern)
         _finalizeWithdrawalState(user, shareAmount, commission0, commission1, principal0, principal1);
 
         // ===== INTERACTIONS — ATOMIC =====
@@ -641,54 +626,14 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
             );
         }
 
-        // Step 3: Calculate and send tokens to user
-        uint256 userFeesNet0 = savedFees0 > commission0 ? savedFees0 - commission0 : 0;
-        uint256 userFeesNet1 = savedFees1 > commission1 ? savedFees1 - commission1 : 0;
+        // Step 3: Send all vault balance to user (no commission to protect)
+        uint256 toSend0 = token0.balanceOf(address(this));
+        uint256 toSend1 = token1.balanceOf(address(this));
 
-        pendingCommissionToken0 += commission0;
-        pendingCommissionToken1 += commission1;
-
-        uint256 vaultBalance0 = token0.balanceOf(address(this));
-        uint256 vaultBalance1 = token1.balanceOf(address(this));
-
-        uint256 maxSendable0 = vaultBalance0 > pendingCommissionToken0 ? vaultBalance0 - pendingCommissionToken0 : 0;
-        uint256 maxSendable1 = vaultBalance1 > pendingCommissionToken1 ? vaultBalance1 - pendingCommissionToken1 : 0;
-
-        // For DN pools: after hedge settlement, vault holds USDC recovered from AAVE.
-        // Use actual vault balance (capped by maxSendable) instead of pre-calculated principal
-        // which only accounts for LP tokens from RangeManager.
-        uint256 toSend0;
-        uint256 toSend1;
-        if (hedgeReserveRatioBps > 0 && hedgeManager != address(0)) {
-            // DN pool: send all available tokens (LP + hedge USDC recovered)
-            toSend0 = maxSendable0;
-            toSend1 = maxSendable1;
-        } else {
-            // Standard pool: use pre-calculated principal + fees
-            toSend0 = principal0 + userFeesNet0;
-            toSend1 = principal1 + userFeesNet1;
-            if (toSend0 > maxSendable0) toSend0 = maxSendable0;
-            if (toSend1 > maxSendable1) toSend1 = maxSendable1;
-        }
-
-        // Update fee tracking
-        if (totalUserFeesInVault0 >= userFeesNet0) {
-            totalUserFeesInVault0 -= userFeesNet0;
-        } else {
-            totalUserFeesInVault0 = 0;
-        }
-        if (totalUserFeesInVault1 >= userFeesNet1) {
-            totalUserFeesInVault1 -= userFeesNet1;
-        } else {
-            totalUserFeesInVault1 = 0;
-        }
-
-        // Send tokens to user
         if (toSend0 > 0) token0.safeTransfer(msg.sender, toSend0);
         if (toSend1 > 0) token1.safeTransfer(msg.sender, toSend1);
 
         emit Withdraw(msg.sender, toSend0, toSend1, shareAmount);
-        emit CommissionCollected(msg.sender, commission0, commission1);
     }
 
     /**
@@ -741,16 +686,10 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
         emit FeesDistributed(fees0, fees1);
     }
     
-    function recordFeesCollected(uint256 fees0, uint256 fees1) public onlyRangeManager {
-        _recordFeesCollectedInternal(fees0, fees1);
-        _distributeFees(fees0, fees1);
-    }
-
-    /**
-     * @notice Fonction interne pour enregistrer les fees collectées
-     * @dev Peut être appelée depuis recordFeesCollected() (RangeManager) ou _executeWithdrawFromRange() (withdraw)
-     */
-    function _recordFeesCollectedInternal(uint256 fees0, uint256 fees1) private {
+    function recordFeesCollected(
+        uint256 fees0, uint256 fees1,
+        uint256 commission0, uint256 commission1
+    ) public onlyRangeManager {
         if (fees0 > 0 || fees1 > 0) {
             feeHistory.push(FeeSnapshot({
                 token0Collected: fees0,
@@ -758,15 +697,12 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
                 timestamp: block.timestamp,
                 blockNumber: block.number
             }));
-
             lastCollectedFees0 = fees0;
             lastCollectedFees1 = fees1;
-
-            // Tracker les fees collectés qui sont maintenant dans le vault
-            // Ces fees sont physiquement disponibles et seront distribués aux users
-            totalUserFeesInVault0 += fees0;
-            totalUserFeesInVault1 += fees1;
+            totalCommissionCollectedToken0 += commission0;
+            totalCommissionCollectedToken1 += commission1;
         }
+        _distributeFees(fees0, fees1);
     }
 
     /**
@@ -954,43 +890,19 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
     ) {
         UserInfo memory info = userInfo[user];
         if (info.shares == 0 || totalShares == 0) return (0, 0, 0, 0);
-
         uint256 userSharePercent = (info.shares * 10000) / totalShares;
-
-        // getCurrentBalances retourne: tokens libres + liquidité position + tokensOwed
-        // (sans le vault pour éviter de compter plusieurs fois les mêmes fees)
         (uint256 totalToken0, uint256 totalToken1) = rangeManager.getCurrentBalances();
-
-        // Calculer le principal disponible (même logique que _calculateWithdrawAmounts)
-        // On soustrait totalUserFeesInVault car ces fees sont déjà comptées dans totalFeesEarned
-        uint256 principalAvailable0 = totalToken0 > totalUserFeesInVault0 ? totalToken0 - totalUserFeesInVault0 : 0;
-        uint256 principalAvailable1 = totalToken1 > totalUserFeesInVault1 ? totalToken1 - totalUserFeesInVault1 : 0;
-
-        // Principal que l'utilisateur recevrait
-        uint256 userPrincipal0 = (principalAvailable0 * userSharePercent) / 10000;
-        uint256 userPrincipal1 = (principalAvailable1 * userSharePercent) / 10000;
-
-        // Fees nets après commission (ce que l'utilisateur recevra)
-        uint256 userFeesNet0 = info.totalFeesEarnedToken0 - (info.totalFeesEarnedToken0 * commissionRate / 10000);
-        uint256 userFeesNet1 = info.totalFeesEarnedToken1 - (info.totalFeesEarnedToken1 * commissionRate / 10000);
-
-        // Total que l'utilisateur recevra = principal + fees nets
-        amount0 = userPrincipal0 + userFeesNet0;
-        amount1 = userPrincipal1 + userFeesNet1;
-
-        // Calculer les fees BRUTS pour l'affichage dans le dashboard
-        // On utilise totalFeesEarnedToken0/1 qui sont trackés par le contrat
-        // Ces fees incluent les fees collectées ET les pending fees crédités
-        // via _updateUserFees() qui lit les fees du système time-weighted
+        // Auto-compound: part proportionnelle du LP (inclut fees compoundees)
+        amount0 = (totalToken0 * userSharePercent) / 10000;
+        amount1 = (totalToken1 * userSharePercent) / 10000;
+        // Fees bruts comptables pour affichage
         fees0 = info.totalFeesEarnedToken0;
         fees1 = info.totalFeesEarnedToken1;
-
-        return (amount0, amount1, fees0, fees1);
     }
 
     /**
-     * @notice Retourne les informations utilisateur avec fees en temps réel
-     * @dev Combine totalFeesEarned (déjà crédités) + pendingFees (pas encore crédités)
+     * @notice Retourne les informations utilisateur avec fees comptables
+     * @dev totalFeesEarnedToken0/1 (deja credites) + pendingFees time-weighted (pas encore credites)
      */
     function getUserInfoWithPendingFees(address user) external view returns (
         uint256 shares,
@@ -1009,11 +921,9 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
         lastDepositTime = info.lastDepositTime;
 
         if (info.shares > 0 && totalShares > 0) {
-            // Part proportionnelle des fees totales dans le vault
-            totalFeesToken0 = (totalUserFeesInVault0 * info.shares) / totalShares;
-            totalFeesToken1 = (totalUserFeesInVault1 * info.shares) / totalShares;
+            totalFeesToken0 = info.totalFeesEarnedToken0;
+            totalFeesToken1 = info.totalFeesEarnedToken1;
 
-            // Ajouter les fees pendants non encore collectées (dans la position)
             uint256 currentTimeWeightedShares = info.timeWeightedShares;
             if (info.lastTimeUpdate > 0) {
                 uint256 timeDelta = block.timestamp - info.lastTimeUpdate;
@@ -1036,55 +946,10 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
     // ===== FONCTIONS DE RETRAITS ET DE COLLECTE =====
     
     /**
-     * @notice Fonction de retrait des commissions
+     * @notice Retourne le total des commissions envoyees au Treasury (comptable)
      */
-    function collectCommissions() external {
-        if (msg.sender != treasuryAddress) revert E02();
-
-        uint256 token0ToCollect = pendingCommissionToken0;
-        uint256 token1ToCollect = pendingCommissionToken1;
-
-        if (token0ToCollect == 0 && token1ToCollect == 0) revert E04();
-
-        // Les commissions sont TOUJOURS dans le vault, jamais dans RangeManager
-        // Vérifier le solde disponible
-        uint256 vaultBalance0 = token0.balanceOf(address(this));
-        uint256 vaultBalance1 = token1.balanceOf(address(this));
-
-        // Collecter uniquement ce qui est disponible dans le vault
-        uint256 actualCollect0 = token0ToCollect < vaultBalance0 ? token0ToCollect : vaultBalance0;
-        uint256 actualCollect1 = token1ToCollect < vaultBalance1 ? token1ToCollect : vaultBalance1;
-
-        // Réduire pendingCommission du montant REELLEMENT collecté
-        pendingCommissionToken0 -= actualCollect0;
-        pendingCommissionToken1 -= actualCollect1;
-
-        // Incrementer les compteurs "total collected"
-        totalCommissionCollectedToken0 += actualCollect0;
-        totalCommissionCollectedToken1 += actualCollect1;
-
-        // Déduire de totalUserFeesInVault les commissions collectées
-        // Car ces commissions font partie des fees totaux dans le vault
-        if (totalUserFeesInVault0 >= actualCollect0) {
-            totalUserFeesInVault0 -= actualCollect0;
-        } else {
-            totalUserFeesInVault0 = 0;
-        }
-        if (totalUserFeesInVault1 >= actualCollect1) {
-            totalUserFeesInVault1 -= actualCollect1;
-        } else {
-            totalUserFeesInVault1 = 0;
-        }
-
-        // Transférer au treasury
-        if (actualCollect0 > 0) {
-            token0.safeTransfer(treasuryAddress, actualCollect0);
-        }
-        if (actualCollect1 > 0) {
-            token1.safeTransfer(treasuryAddress, actualCollect1);
-        }
-
-        emit CommissionsCollected(actualCollect0, actualCollect1);
+    function getTotalCommissions() external view returns (uint256 total0, uint256 total1) {
+        return (totalCommissionCollectedToken0, totalCommissionCollectedToken1);
     }
 
     /**
@@ -1196,29 +1061,11 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
      *      Les fees sont envoyées au vault et distribuées via le système time-weighted
      *      L'utilisateur recevra sa part proportionnelle lors du withdraw
      */
-    function _handleUnclaimedFeesOnWithdraw(UserInfo storage /* user */, uint256 shareAmount) private {
+    function _handleUnclaimedFeesOnWithdraw(UserInfo storage /* user */, uint256 /* shareAmount */) private {
         uint256[] memory positions = rangeManager.getOwnerPositions();
         if (positions.length == 0) return;
-
-        // Estimer les fees pour l'event
-        (uint256 unclaimedFees0, uint256 unclaimedFees1) = estimateTotalFees(positions[0]);
-        if (unclaimedFees0 == 0 && unclaimedFees1 == 0) return;
-
-        // Collecter les fees du NFT et les distribuer via recordFeesCollected
-        // Cette fonction:
-        // 1. Collecte les fees du NFT et les envoie au vault
-        // 2. Appelle recordFeesCollected qui met à jour totalUserFeesInVault et distribue via _distributeFees
-        // 3. Les fees sont donc disponibles pour le withdraw qui suit
         rangeManager.collectFeesForVault();
-
-        // Recalculer les fees de l'utilisateur après distribution
         _updateUserFees(msg.sender);
-
-        (uint256 userShare0, uint256 userShare1) = calculateUserShareOfFees(
-            uint128(unclaimedFees0), uint128(unclaimedFees1), shareAmount
-        );
-
-        emit FeesCollectedOnWithdraw(msg.sender, userShare0, userShare1, unclaimedFees0, unclaimedFees1);
     }
 
     /**
@@ -1227,19 +1074,10 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
     function _calculateWithdrawAmounts(
         uint256 shareAmount
     ) private view returns (uint256 commission0, uint256 commission1, uint256 principal0, uint256 principal1) {
-        // Calculer le pourcentage de shares retirées par rapport au total global
         uint256 userSharePercent = totalShares > 0 ? (shareAmount * 10000) / totalShares : 0;
-
-        uint256 userFees0Proportional = (totalUserFeesInVault0 * userSharePercent) / 10000;
-        uint256 userFees1Proportional = (totalUserFeesInVault1 * userSharePercent) / 10000;
-
-        // Commission sur les fees (10% par défaut)
-        commission0 = (userFees0Proportional * commissionRate) / 10000;
-        commission1 = (userFees1Proportional * commissionRate) / 10000;
-
         (uint256 totalToken0, uint256 totalToken1) = rangeManager.getCurrentBalances();
-
-        // Le principal est la part proportionnelle du solde RangeManager
+        commission0 = 0;
+        commission1 = 0;
         principal0 = (totalToken0 * userSharePercent) / 10000;
         principal1 = (totalToken1 * userSharePercent) / 10000;
     }
@@ -1250,8 +1088,8 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
     function _finalizeWithdrawalState(
         UserInfo storage user,
         uint256 shareAmount,
-        uint256 commission0,
-        uint256 commission1,
+        uint256,
+        uint256,
         uint256,
         uint256
     ) private {
@@ -1263,9 +1101,6 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
         }
 
         _updateGlobalTimeWeightedShares();
-
-        totalCommissionCollectedToken0 += commission0;
-        totalCommissionCollectedToken1 += commission1;
     }
 
     /**
@@ -1394,8 +1229,8 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
         uint256 currentRate
     ) {
         return (
-            pendingCommissionToken0,
-            pendingCommissionToken1,
+            0, // plus de pending — commissions envoyees directement au Treasury
+            0,
             totalCommissionCollectedToken0,
             totalCommissionCollectedToken1,
             commissionRate
@@ -1498,9 +1333,9 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
         uint256 toSend0;
         uint256 toSend1;
         if (hedgeReserveRatioBps > 0 && hedgeManager != address(0)) {
-            // DN: solde vault moins les commissions en attente d'autres users
-            toSend0 = bal0 > pendingCommissionToken0 ? bal0 - pendingCommissionToken0 : 0;
-            toSend1 = bal1 > pendingCommissionToken1 ? bal1 - pendingCommissionToken1 : 0;
+            // DN: envoyer tout le solde vault (plus de commissions en attente avec auto-compound)
+            toSend0 = bal0;
+            toSend1 = bal1;
         } else {
             // Standard: cap par userAmount
             toSend0 = userAmount0 > bal0 ? bal0 : userAmount0;

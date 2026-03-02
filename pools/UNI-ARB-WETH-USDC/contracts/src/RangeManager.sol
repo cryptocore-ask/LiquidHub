@@ -21,7 +21,7 @@ interface IMultiUserVault {
     function snapshotFees(uint256, uint256) external;
     function notifyFeesCollected(uint256 fees0, uint256 fees1) external;
     function getCurrentPortfolioValue() external view returns (uint256);
-    function recordFeesCollected(uint256, uint256) external;
+    function recordFeesCollected(uint256 fees0, uint256 fees1, uint256 commission0, uint256 commission1) external;
     function getUserCount() external view returns (uint256);
     function getUserAtIndex(uint256 index) external view returns (address);
     function totalShares() external view returns (uint256);
@@ -488,9 +488,14 @@ contract RangeManager is Ownable, ReentrancyGuard {
             uint256 fees0 = totalReceived0 > amount0FromLiq ? totalReceived0 - amount0FromLiq : 0;
             uint256 fees1 = totalReceived1 > amount1FromLiq ? totalReceived1 - amount1FromLiq : 0;
 
-            // IMPORTANT: Notifier le vault des fees collectées pour qu'elles soient trackées
+            // Auto-compound: commission au Treasury, fees nettes restent sur le RM
             if (fees0 > 0 || fees1 > 0) {
-                IMultiUserVault(vault).recordFeesCollected(fees0, fees1);
+                uint256 commRate = IMultiUserVault(vault).commissionRate();
+                uint256 commission0 = (fees0 * commRate) / 10000;
+                uint256 commission1 = (fees1 * commRate) / 10000;
+                if (commission0 > 0) IERC20(token0).safeTransfer(treasuryAddress, commission0);
+                if (commission1 > 0) IERC20(token1).safeTransfer(treasuryAddress, commission1);
+                IMultiUserVault(vault).recordFeesCollected(fees0, fees1, commission0, commission1);
             }
 
             emit TokenWithdrawn(token0, 0, "Liquidity removed for withdrawal");
@@ -555,11 +560,11 @@ contract RangeManager is Ownable, ReentrancyGuard {
             ) {} catch {}
         }
 
-        // Collecter toutes les fees et les envoyer directement au vault
+        // Collecter les fees sur le RM (pas le vault) pour auto-compound
         try positionManager.collect(
             INonfungiblePositionManager.CollectParams({
                 tokenId: tokenId,
-                recipient: vault,
+                recipient: address(this),
                 amount0Max: type(uint128).max,
                 amount1Max: type(uint128).max
             })
@@ -571,9 +576,16 @@ contract RangeManager is Ownable, ReentrancyGuard {
             fees1 = 0;
         }
 
-        // Notifier le vault des fees collectées pour distribution
+        // Auto-compound: commission au Treasury, fees nettes restent sur le RM
         if (fees0 > 0 || fees1 > 0) {
-            IMultiUserVault(vault).recordFeesCollected(fees0, fees1);
+            uint256 commRate = IMultiUserVault(vault).commissionRate();
+            uint256 commission0 = (fees0 * commRate) / 10000;
+            uint256 commission1 = (fees1 * commRate) / 10000;
+
+            if (commission0 > 0) IERC20(token0).safeTransfer(treasuryAddress, commission0);
+            if (commission1 > 0) IERC20(token1).safeTransfer(treasuryAddress, commission1);
+
+            IMultiUserVault(vault).recordFeesCollected(fees0, fees1, commission0, commission1);
             emit FeesCollectedForVault(fees0, fees1);
         }
 
@@ -948,18 +960,19 @@ contract RangeManager is Ownable, ReentrancyGuard {
             );
         }
 
-        // 4. Reporter les fees au Vault pour distribution aux utilisateurs
+        // 4. Auto-compound: commission au Treasury, fees nettes restent sur le RM
         if (fees0 > 0 || fees1 > 0) {
-            // Transferer PHYSIQUEMENT les fees au vault
-            if (fees0 > 0) {
-                IERC20(token0).safeTransfer(vault, fees0);
-            }
-            if (fees1 > 0) {
-                IERC20(token1).safeTransfer(vault, fees1);
-            }
+            uint256 commRate = IMultiUserVault(vault).commissionRate();
+            uint256 commission0 = (fees0 * commRate) / 10000;
+            uint256 commission1 = (fees1 * commRate) / 10000;
 
-            // Enregistrer ET distribuer les fees aux utilisateurs
-            IMultiUserVault(vault).recordFeesCollected(fees0, fees1);
+            // Commission directement au Treasury
+            if (commission0 > 0) IERC20(token0).safeTransfer(treasuryAddress, commission0);
+            if (commission1 > 0) IERC20(token1).safeTransfer(treasuryAddress, commission1);
+
+            // Notification comptable au vault (pas de transfer de tokens)
+            IMultiUserVault(vault).recordFeesCollected(fees0, fees1, commission0, commission1);
+            // fees nettes restent sur le RM → auto-compound dans mintInitialPosition()
         }
 
         // 5. Burn le NFT

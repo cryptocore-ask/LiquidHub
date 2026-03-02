@@ -49,6 +49,7 @@ contract Treasury is Ownable {
     event KeeperBountyConfigured(bool enabled, uint256 amount);
     event BridgeConfigured(bool enabled, uint16 chainId, address destination);
     event BridgedToStakers(uint256 amount, uint16 destinationChainId);
+    event RangeManagerAuthorized(address indexed rangeManager, bool authorized);
 
     constructor(
         address _usdc,
@@ -148,6 +149,7 @@ contract Treasury is Ownable {
 
     function authorizeRangeManager(address _rangeManager, bool _authorized) external onlyOwner {
         authorizedRangeManagers[_rangeManager] = _authorized;
+        emit RangeManagerAuthorized(_rangeManager, _authorized);
     }
 
     // --- Phase 2 Prep (LayerZero bridge + staking) ---
