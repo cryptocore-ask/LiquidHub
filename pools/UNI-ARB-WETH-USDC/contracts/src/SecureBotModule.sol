@@ -29,6 +29,7 @@ contract SecureBotModule {
     event FunctionAllowed(bytes4 indexed selector, bool allowed);
     event DailyLimitUpdated(uint256 newLimit);
     event Paused(bool paused);
+    event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);
     
     constructor(
         address _safe,
@@ -138,7 +139,13 @@ contract SecureBotModule {
         paused = _paused;
         emit Paused(_paused);
     }
-    
+
+    function transferOwnership(address newOwner) external onlyOwner {
+        require(newOwner != address(0), "Invalid address");
+        emit OwnershipTransferred(owner, newOwner);
+        owner = newOwner;
+    }
+
     // Fonctions de lecture
     function getDailyStats() external view returns (
         uint256 limit,

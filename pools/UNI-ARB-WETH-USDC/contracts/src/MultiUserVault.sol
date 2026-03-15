@@ -96,7 +96,8 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
     PendingDeposit[] public pendingDeposits;
     
     uint256 public totalShares;
-    
+    uint256 private constant DEAD_SHARES = 1000; // Brûlées au premier dépôt (anti-inflation attack)
+
     // Systeme de tracking des fees
     mapping(address => uint256) public userFeeDebtToken0;
     mapping(address => uint256) public userFeeDebtToken1;
@@ -125,17 +126,6 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
     event PendingDepositAdded(address indexed user, uint256 amount0, uint256 amount1);
     event DepositsProcessed(uint256 count, uint256 totalAmount0, uint256 totalAmount1);
     event FeesDistributed(uint256 fees0, uint256 fees1);
-    event ProtocolFeesCollected(uint256 fees0, uint256 fees1);
-    event FeesCollectedOnWithdraw(
-        address indexed user,
-        uint256 userShareFees0,
-        uint256 userShareFees1,
-        uint256 totalCollected0,
-        uint256 totalCollected1
-    );
-    event FeesCollected(uint256 fees0, uint256 fees1);
-    event CommissionCollected(address indexed user, uint256 token0Amount, uint256 token1Amount);
-    event CommissionsCollected(uint256 token0Amount, uint256 token1Amount);
     event CommissionRateUpdated(uint256 oldRate, uint256 newRate);
     event RebalancingStarted(uint256 timestamp);
     event RebalancingEnded(uint256 timestamp);
@@ -329,6 +319,9 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
         uint256 totalAmount1;
         uint256 currentTotalValue = _calculateTotalValue();
         
+        // Mettre à jour les time-weighted shares globales AVANT modification de totalShares
+        _updateGlobalTimeWeightedShares();
+
         // Traiter chaque depot
         for (uint256 i = 0; i < depositsCount; i++) {
             
@@ -339,13 +332,16 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
             uint256 sharesToMint;
             
             if (totalShares == 0) {
-                // Pour le premier dépôt, utiliser une base raisonnable
-                sharesToMint = depositValue * 1e10; // Si depositValue est en 8 décimales Chainlink
+                // Premier dépôt : brûler DEAD_SHARES pour empêcher l'inflation attack
+                sharesToMint = depositValue * 1e10;
+                require(sharesToMint > DEAD_SHARES, "First deposit too small");
+                sharesToMint -= DEAD_SHARES;
+                totalShares += DEAD_SHARES; // Dead shares permanentes (pas attribuées)
             } else {
                 require(currentTotalValue > 0, "E25");
                 sharesToMint = (depositValue * totalShares) / currentTotalValue;
             }
-            
+
             // Mettre a jour les infos utilisateur
             UserInfo storage user = userInfo[pd.user];
             
@@ -388,9 +384,6 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
             
             emit Deposit(pd.user, pd.amount0, pd.amount1, sharesToMint);
         }
-        
-        // Mettre à jour les statistiques globales time-weighted après traitement
-        _updateGlobalTimeWeightedShares();
         
         // Envoyer les fonds au RangeManager
         if (totalAmount0 > 0) {
@@ -449,10 +442,16 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
 
         if (totalShares == 0) {
             sharesToMint = depositValue * 1e10;
+            require(sharesToMint > DEAD_SHARES, "First deposit too small");
+            sharesToMint -= DEAD_SHARES;
+            totalShares += DEAD_SHARES; // Dead shares permanentes (pas attribuées)
         } else {
             require(currentTotalValue > 0, "E25");
             sharesToMint = (depositValue * totalShares) / currentTotalValue;
         }
+
+        // Mettre à jour les time-weighted shares globales AVANT modification de totalShares
+        _updateGlobalTimeWeightedShares();
 
         // Mettre a jour les infos utilisateur
         UserInfo storage user = userInfo[pd.user];
@@ -480,8 +479,6 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
 
         totalShares += sharesToMint;
         hasPendingDeposit[pd.user] = false;
-
-        _updateGlobalTimeWeightedShares();
 
         // Envoyer les fonds de CE DEPOT UNIQUEMENT au RangeManager
         if (pd.amount0 > 0) {
@@ -571,14 +568,9 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
     }
     
     // ===== FEES MANAGEMENT =====
-    
-    function snapshotFees(uint256 fees0, uint256 fees1) public onlyRangeManager {
-        _distributeFees(fees0, fees1);
-    }
 
     /**
      * @notice Fonction interne pour distribuer les fees aux utilisateurs
-     * @dev Peut être appelée depuis snapshotFees() (rebalance) ou _executeWithdrawFromRange() (withdraw)
      */
     function _distributeFees(uint256 fees0, uint256 fees1) private {
         if (totalShares == 0) return;
@@ -587,13 +579,13 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
         // Mettre à jour les time-weighted shares globales avant distribution
         _updateGlobalTimeWeightedShares();
 
-        // Distribuer 100% des fees brutes pour le tracking comptable
-        // La commission est deja prelevee dans le RangeManager et envoyee au Treasury
+        // Distribuer les fees nettes aux users (commission deja envoyee au Treasury)
 
         // Mettre à jour les fees cumulatives par time-weighted share
+        // Precision 1e36 pour eviter perte d'arrondi sur tokens a faibles decimales (ex: USDC 6 dec)
         if (totalTimeWeightedShares > 0) {
-            cumulativeFeePerTimeWeightedShare0 += (fees0 * 1e18) / totalTimeWeightedShares;
-            cumulativeFeePerTimeWeightedShare1 += (fees1 * 1e18) / totalTimeWeightedShares;
+            cumulativeFeePerTimeWeightedShare0 += (fees0 * 1e36) / totalTimeWeightedShares;
+            cumulativeFeePerTimeWeightedShare1 += (fees1 * 1e36) / totalTimeWeightedShares;
         }
 
         // Créditer immédiatement les fees dans totalFeesEarnedToken0/1
@@ -619,7 +611,10 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
             totalCommissionCollectedToken0 += commission0;
             totalCommissionCollectedToken1 += commission1;
         }
-        _distributeFees(fees0, fees1);
+        // Distribuer les fees NETTES aux users (brutes - commission deja envoyee au Treasury)
+        uint256 netFees0 = fees0 > commission0 ? fees0 - commission0 : 0;
+        uint256 netFees1 = fees1 > commission1 ? fees1 - commission1 : 0;
+        _distributeFees(netFees0, netFees1);
     }
 
     /**
@@ -658,8 +653,8 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
         UserInfo storage user = userInfo[userAddress];
         if (user.timeWeightedShares == 0) return;
 
-        uint256 pending0 = (user.timeWeightedShares * cumulativeFeePerTimeWeightedShare0 - userFeeDebtToken0[userAddress]) / 1e18;
-        uint256 pending1 = (user.timeWeightedShares * cumulativeFeePerTimeWeightedShare1 - userFeeDebtToken1[userAddress]) / 1e18;
+        uint256 pending0 = (user.timeWeightedShares * cumulativeFeePerTimeWeightedShare0 - userFeeDebtToken0[userAddress]) / 1e36;
+        uint256 pending1 = (user.timeWeightedShares * cumulativeFeePerTimeWeightedShare1 - userFeeDebtToken1[userAddress]) / 1e36;
 
         user.totalFeesEarnedToken0 += pending0;
         user.totalFeesEarnedToken1 += pending1;
@@ -783,8 +778,8 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
             
             // Calculer les fees basées sur time-weighted shares
             if (currentTimeWeightedShares > 0) {
-                pendingFees0 = (currentTimeWeightedShares * cumulativeFeePerTimeWeightedShare0 - userFeeDebtToken0[user]) / 1e18;
-                pendingFees1 = (currentTimeWeightedShares * cumulativeFeePerTimeWeightedShare1 - userFeeDebtToken1[user]) / 1e18;
+                pendingFees0 = (currentTimeWeightedShares * cumulativeFeePerTimeWeightedShare0 - userFeeDebtToken0[user]) / 1e36;
+                pendingFees1 = (currentTimeWeightedShares * cumulativeFeePerTimeWeightedShare1 - userFeeDebtToken1[user]) / 1e36;
             }
         }
     }
@@ -840,8 +835,8 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
             }
 
             if (currentTimeWeightedShares > 0 && cumulativeFeePerTimeWeightedShare0 > 0) {
-                uint256 pending0 = (currentTimeWeightedShares * cumulativeFeePerTimeWeightedShare0 - userFeeDebtToken0[user]) / 1e18;
-                uint256 pending1 = (currentTimeWeightedShares * cumulativeFeePerTimeWeightedShare1 - userFeeDebtToken1[user]) / 1e18;
+                uint256 pending0 = (currentTimeWeightedShares * cumulativeFeePerTimeWeightedShare0 - userFeeDebtToken0[user]) / 1e36;
+                uint256 pending1 = (currentTimeWeightedShares * cumulativeFeePerTimeWeightedShare1 - userFeeDebtToken1[user]) / 1e36;
 
                 totalFeesToken0 += pending0;
                 totalFeesToken1 += pending1;
@@ -1043,14 +1038,15 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
         uint256,
         uint256
     ) private {
+        // Mettre à jour les time-weighted shares globales AVANT modification de totalShares
+        _updateGlobalTimeWeightedShares();
+
         uint256 timeWeightedToReduce = _updateUserStateAfterWithdrawal(user, shareAmount);
 
         totalShares -= shareAmount;
         if (timeWeightedToReduce <= totalTimeWeightedShares) {
             totalTimeWeightedShares -= timeWeightedToReduce;
         }
-
-        _updateGlobalTimeWeightedShares();
     }
 
     /**
@@ -1193,24 +1189,6 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
         );
     }
     
-    /**
-     * @notice Fonction pour notification des fees collectees
-     */
-    function notifyFeesCollected(uint256 fees0, uint256 fees1) external onlyRangeManager {
-        if (totalShares == 0) return;
-        
-        // Mettre à jour les time-weighted shares globales avant distribution
-        _updateGlobalTimeWeightedShares();
-        
-        // Distribuer proportionnellement aux time-weighted shares
-        if (totalTimeWeightedShares > 0) {
-            cumulativeFeePerTimeWeightedShare0 += (fees0 * 1e18) / totalTimeWeightedShares;
-            cumulativeFeePerTimeWeightedShare1 += (fees1 * 1e18) / totalTimeWeightedShares;
-        }
-        
-        emit FeesCollected(fees0, fees1);
-    }
-     
     // ===== FONCTIONS DE RECUPERATION USER ET TOKENS PERDUS =====
          
      

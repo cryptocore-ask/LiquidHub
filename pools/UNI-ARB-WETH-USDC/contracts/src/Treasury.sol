@@ -6,11 +6,58 @@ import "openzeppelin-contracts/contracts/token/ERC20/IERC20.sol";
 import "openzeppelin-contracts/contracts/token/ERC20/utils/SafeERC20.sol";
 import "v3-periphery/contracts/interfaces/ISwapRouter.sol";
 
-interface ILayerZeroEndpoint {
-    function send(uint16 _dstChainId, bytes calldata _destination, bytes calldata _payload,
-        address payable _refundAddress, address _zroPaymentAddress, bytes calldata _adapterParams) external payable;
-    function estimateFees(uint16 _dstChainId, address _userApplication, bytes calldata _payload,
-        bool _payInZRO, bytes calldata _adapterParam) external view returns (uint256 nativeFee, uint256 zroFee);
+// --- Stargate v2 Interfaces ---
+
+struct SendParam {
+    uint32  dstEid;         // Destination LayerZero v2 endpoint ID
+    bytes32 to;             // Recipient address, left-padded to bytes32
+    uint256 amountLD;       // Amount in local decimals (USDC = 6)
+    uint256 minAmountLD;    // Minimum received (slippage guard)
+    bytes   extraOptions;   // LayerZero executor options (empty for default)
+    bytes   composeMsg;     // Composed message for destination (empty if none)
+    bytes   oftCmd;         // "" = Taxi (immediate), hex"00" = Bus (batched)
+}
+
+struct MessagingFee {
+    uint256 nativeFee;      // Fee in native token (ETH/AVAX/MATIC/BNB)
+    uint256 lzTokenFee;     // Fee in ZRO token (always 0, we pay native)
+}
+
+struct MessagingReceipt {
+    bytes32 guid;
+    uint64  nonce;
+    MessagingFee fee;
+}
+
+struct OFTReceipt {
+    uint256 amountSentLD;
+    uint256 amountReceivedLD;
+}
+
+struct OFTLimit {
+    uint256 minAmountLD;
+    uint256 maxAmountLD;
+}
+
+struct OFTFeeDetail {
+    int256  feeAmountLD;
+    string  description;
+}
+
+struct Ticket {
+    uint56  ticketId;
+    bytes   passengerBytes;
+}
+
+interface IStargate {
+    function quoteSend(SendParam calldata _sendParam, bool _payInLzToken)
+        external view returns (MessagingFee memory fee);
+
+    function quoteOFT(SendParam calldata _sendParam)
+        external view returns (OFTLimit memory, OFTFeeDetail[] memory, OFTReceipt memory);
+
+    function sendToken(SendParam calldata _sendParam, MessagingFee calldata _fee, address _refundAddress)
+        external payable returns (MessagingReceipt memory, OFTReceipt memory, Ticket memory);
 }
 
 contract Treasury is Ownable {
@@ -19,7 +66,7 @@ contract Treasury is Ownable {
     // --- Immutables ---
     IERC20 public immutable usdc;
     ISwapRouter public immutable swapRouter;
-    ILayerZeroEndpoint public immutable lzEndpoint;
+    IStargate public immutable stargatePool;
 
     // --- State ---
     uint256 public monthlyCap;
@@ -33,10 +80,10 @@ contract Treasury is Ownable {
     uint256 public keeperBountyAmount;
     mapping(address => bool) public authorizedRangeManagers;
 
-    // --- Bridge (Phase 2) ---
+    // --- Bridge (Stargate v2) ---
     bool public bridgeEnabled;
-    uint16 public bridgeDestinationChainId;
-    address public bridgeDestinationAddress;
+    uint32 public bridgeDestinationEid;     // LayerZero v2 endpoint ID (e.g. 30184 = Base)
+    address public bridgeDestinationAddress; // Recipient on destination chain (staking contract)
 
     // --- Events ---
     event AdminWithdrawal(uint256 amount, address indexed to);
@@ -47,9 +94,10 @@ contract Treasury is Ownable {
     event SwappedToUSDC(address indexed tokenIn, uint24 fee, uint256 amountIn, uint256 usdcOut);
     event KeeperBountyPaid(address indexed keeper, uint256 amount);
     event KeeperBountyConfigured(bool enabled, uint256 amount);
-    event BridgeConfigured(bool enabled, uint16 chainId, address destination);
-    event BridgedToStakers(uint256 amount, uint16 destinationChainId);
+    event BridgeConfigured(bool enabled, uint32 dstEid, address destination);
+    event BridgedToStakers(uint256 amountSent, uint256 amountReceived, uint32 dstEid, bytes32 guid);
     event RangeManagerAuthorized(address indexed rangeManager, bool authorized);
+    event CollectedAndBridged(address indexed tokenIn, uint256 swappedUSDC, uint256 bridgedUSDC, uint32 dstEid);
 
     constructor(
         address _usdc,
@@ -57,7 +105,7 @@ contract Treasury is Ownable {
         uint256 _monthlyCap,
         bool _keeperBountyEnabled,
         uint256 _keeperBountyAmount,
-        address _lzEndpoint
+        address _stargatePool
     ) {
         usdc = IERC20(_usdc);
         swapRouter = ISwapRouter(_swapRouter);
@@ -66,7 +114,7 @@ contract Treasury is Ownable {
         currentMonthStart = block.timestamp;
         keeperBountyEnabled = _keeperBountyEnabled;
         keeperBountyAmount = _keeperBountyAmount;
-        lzEndpoint = ILayerZeroEndpoint(_lzEndpoint);
+        stargatePool = IStargate(_stargatePool);
     }
 
     receive() external payable {}
@@ -97,6 +145,129 @@ contract Treasury is Ownable {
 
         amountOut = swapRouter.exactInputSingle(params);
         emit SwappedToUSDC(tokenIn, fee, amountIn, amountOut);
+    }
+
+    /// @notice Bridge USDC to staking contract on destination chain via Stargate v2. Callable by anyone.
+    /// @dev Uses Taxi mode (immediate delivery). Caller pays native gas for cross-chain fees via msg.value.
+    function bridgeToStakers(uint256 amount) external payable {
+        require(bridgeEnabled, "Bridge disabled");
+        require(bridgeDestinationAddress != address(0), "Destination not set");
+        require(usdc.balanceOf(address(this)) >= amount, "Insufficient USDC");
+
+        // Build SendParam (Taxi mode = empty oftCmd)
+        SendParam memory sendParam = SendParam({
+            dstEid: bridgeDestinationEid,
+            to: bytes32(uint256(uint160(bridgeDestinationAddress))),
+            amountLD: amount,
+            minAmountLD: 0, // will be set after quoteOFT
+            extraOptions: new bytes(0),
+            composeMsg: new bytes(0),
+            oftCmd: ""  // Taxi = immediate delivery
+        });
+
+        // Get actual received amount (after Stargate fee)
+        (, , OFTReceipt memory receipt) = stargatePool.quoteOFT(sendParam);
+        sendParam.minAmountLD = receipt.amountReceivedLD;
+
+        // Get messaging fee in native token
+        MessagingFee memory fee = stargatePool.quoteSend(sendParam, false);
+        require(msg.value >= fee.nativeFee, "Insufficient native fee");
+
+        // Approve Stargate pool to spend USDC
+        usdc.safeApprove(address(stargatePool), 0);
+        usdc.safeApprove(address(stargatePool), amount);
+
+        // Execute cross-chain transfer
+        (MessagingReceipt memory msgReceipt, OFTReceipt memory oftReceipt, ) =
+            stargatePool.sendToken{value: fee.nativeFee}(sendParam, fee, msg.sender);
+
+        emit BridgedToStakers(oftReceipt.amountSentLD, oftReceipt.amountReceivedLD, bridgeDestinationEid, msgReceipt.guid);
+    }
+
+    /// @notice Swap token to USDC + bridge to staking in one transaction. Callable by anyone.
+    /// @dev Caller pays native gas for Stargate cross-chain fees via msg.value.
+    function collectAndBridge(
+        address tokenIn,
+        uint24 fee,
+        uint256 amountIn,
+        uint256 minSwapOut
+    ) external payable returns (uint256 usdcBridged) {
+        require(bridgeEnabled, "Bridge disabled");
+        require(bridgeDestinationAddress != address(0), "Destination not set");
+
+        // Step 1: Swap to USDC (if not already USDC)
+        uint256 usdcAmount;
+        if (tokenIn == address(usdc)) {
+            usdcAmount = amountIn;
+            require(usdc.balanceOf(address(this)) >= amountIn, "Insufficient USDC");
+        } else {
+            require(amountIn > 0, "Zero amount");
+            IERC20 token = IERC20(tokenIn);
+            require(token.balanceOf(address(this)) >= amountIn, "Insufficient balance");
+
+            token.safeApprove(address(swapRouter), 0);
+            token.safeApprove(address(swapRouter), amountIn);
+
+            ISwapRouter.ExactInputSingleParams memory swapParams = ISwapRouter.ExactInputSingleParams({
+                tokenIn: tokenIn,
+                tokenOut: address(usdc),
+                fee: fee,
+                recipient: address(this),
+                deadline: block.timestamp,
+                amountIn: amountIn,
+                amountOutMinimum: minSwapOut,
+                sqrtPriceLimitX96: 0
+            });
+
+            usdcAmount = swapRouter.exactInputSingle(swapParams);
+            emit SwappedToUSDC(tokenIn, fee, amountIn, usdcAmount);
+        }
+
+        // Step 2: Bridge all swapped USDC via Stargate
+        SendParam memory sendParam = SendParam({
+            dstEid: bridgeDestinationEid,
+            to: bytes32(uint256(uint160(bridgeDestinationAddress))),
+            amountLD: usdcAmount,
+            minAmountLD: 0,
+            extraOptions: new bytes(0),
+            composeMsg: new bytes(0),
+            oftCmd: ""
+        });
+
+        (, , OFTReceipt memory receipt) = stargatePool.quoteOFT(sendParam);
+        sendParam.minAmountLD = receipt.amountReceivedLD;
+
+        MessagingFee memory msgFee = stargatePool.quoteSend(sendParam, false);
+        require(msg.value >= msgFee.nativeFee, "Insufficient native fee");
+
+        usdc.safeApprove(address(stargatePool), 0);
+        usdc.safeApprove(address(stargatePool), usdcAmount);
+
+        (, OFTReceipt memory oftReceipt, ) =
+            stargatePool.sendToken{value: msgFee.nativeFee}(sendParam, msgFee, msg.sender);
+
+        usdcBridged = oftReceipt.amountReceivedLD;
+        emit CollectedAndBridged(tokenIn, usdcAmount, usdcBridged, bridgeDestinationEid);
+    }
+
+    /// @notice Estimate bridge fee in native token (ETH/AVAX/MATIC/BNB)
+    function estimateBridgeFee(uint256 amount) external view returns (uint256 nativeFee, uint256 amountReceived) {
+        SendParam memory sendParam = SendParam({
+            dstEid: bridgeDestinationEid,
+            to: bytes32(uint256(uint160(bridgeDestinationAddress))),
+            amountLD: amount,
+            minAmountLD: 0,
+            extraOptions: new bytes(0),
+            composeMsg: new bytes(0),
+            oftCmd: ""
+        });
+
+        (, , OFTReceipt memory receipt) = stargatePool.quoteOFT(sendParam);
+        amountReceived = receipt.amountReceivedLD;
+
+        sendParam.minAmountLD = amountReceived;
+        MessagingFee memory fee = stargatePool.quoteSend(sendParam, false);
+        nativeFee = fee.nativeFee;
     }
 
     // --- Admin Functions (onlyOwner = Safe) ---
@@ -152,45 +323,16 @@ contract Treasury is Ownable {
         emit RangeManagerAuthorized(_rangeManager, _authorized);
     }
 
-    // --- Phase 2 Prep (LayerZero bridge + staking) ---
+    // --- Bridge Configuration (onlyOwner = Safe) ---
 
-    function setBridgeConfig(bool _enabled, uint16 _chainId, address _destination) external onlyOwner {
+    function setBridgeConfig(bool _enabled, uint32 _dstEid, address _destination) external onlyOwner {
         bridgeEnabled = _enabled;
-        bridgeDestinationChainId = _chainId;
+        bridgeDestinationEid = _dstEid;
         bridgeDestinationAddress = _destination;
-        emit BridgeConfigured(_enabled, _chainId, _destination);
+        emit BridgeConfigured(_enabled, _dstEid, _destination);
     }
 
-    /// @notice Bridge USDC to StakingRewards on destination chain via LayerZero. Callable by anyone.
-    function bridgeToStakers(uint256 amount) external payable {
-        require(bridgeEnabled, "Bridge disabled");
-        require(bridgeDestinationAddress != address(0), "Destination not set");
-        require(usdc.balanceOf(address(this)) >= amount, "Insufficient USDC");
-
-        bytes memory payload = abi.encode(bridgeDestinationAddress, amount);
-        lzEndpoint.send{value: msg.value}(
-            bridgeDestinationChainId,
-            abi.encodePacked(bridgeDestinationAddress),
-            payload,
-            payable(msg.sender),
-            address(0),
-            bytes("")
-        );
-
-        emit BridgedToStakers(amount, bridgeDestinationChainId);
-    }
-
-    /// @notice Estimate LayerZero bridge fee
-    function estimateBridgeFee(uint256 amount) external view returns (uint256 nativeFee, uint256 zroFee) {
-        bytes memory payload = abi.encode(bridgeDestinationAddress, amount);
-        return lzEndpoint.estimateFees(
-            bridgeDestinationChainId,
-            address(this),
-            payload,
-            false,
-            bytes("")
-        );
-    }
+    // --- Local Staking (same chain, Phase 2) ---
 
     function setStakingRewards(address _stakingRewards) external onlyOwner {
         require(_stakingRewards != address(0), "Invalid address");
@@ -198,6 +340,7 @@ contract Treasury is Ownable {
         emit StakingRewardsSet(_stakingRewards);
     }
 
+    /// @notice Distribute USDC to local staking contract (same chain). Callable by anyone.
     function distributeToStakers(uint256 amount) external {
         require(stakingRewardsAddress != address(0), "Staking not configured");
         usdc.safeTransfer(stakingRewardsAddress, amount);

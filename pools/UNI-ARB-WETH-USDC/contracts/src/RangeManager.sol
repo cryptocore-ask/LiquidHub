@@ -18,8 +18,6 @@ interface ITreasury {
 
 interface IMultiUserVault {
     function isAuthorizedRecipient(address) external view returns (bool);
-    function snapshotFees(uint256, uint256) external;
-    function notifyFeesCollected(uint256 fees0, uint256 fees1) external;
     function getCurrentPortfolioValue() external view returns (uint256);
     function recordFeesCollected(uint256 fees0, uint256 fees1, uint256 commission0, uint256 commission1) external;
     function getUserCount() external view returns (uint256);
@@ -446,6 +444,8 @@ contract RangeManager is Ownable, ReentrancyGuard {
 
     /**
      * @notice Retire de la liquidite pour un withdraw utilisateur
+     * @dev Pas de commission ici : les fees sont deja commissionnees par collectFeesForVault()
+     *      appele dans _handleUnclaimedFeesOnWithdraw() du Vault avant ce call.
      */
     function removeLiquidityForWithdraw(uint256 tokenId, uint128 liquidityToRemove)
         external
@@ -453,12 +453,8 @@ contract RangeManager is Ownable, ReentrancyGuard {
         nonReentrant
     {
         if (liquidityToRemove > 0) {
-            // Sauvegarder les balances avant pour calculer les fees
-            uint256 balanceBefore0 = IERC20(token0).balanceOf(address(this));
-            uint256 balanceBefore1 = IERC20(token1).balanceOf(address(this));
-
             // Retirer la liquidite
-            (uint256 amount0FromLiq, uint256 amount1FromLiq) = positionManager.decreaseLiquidity(
+            positionManager.decreaseLiquidity(
                 INonfungiblePositionManager.DecreaseLiquidityParams({
                     tokenId: tokenId,
                     liquidity: liquidityToRemove,
@@ -468,7 +464,7 @@ contract RangeManager is Ownable, ReentrancyGuard {
                 })
             );
 
-            // Collecter les tokens (principal + fees)
+            // Collecter les tokens (principal uniquement, fees deja collectees par collectFeesForVault)
             positionManager.collect(
                 INonfungiblePositionManager.CollectParams({
                     tokenId: tokenId,
@@ -477,26 +473,6 @@ contract RangeManager is Ownable, ReentrancyGuard {
                     amount1Max: type(uint128).max
                 })
             );
-
-            // Calculer les fees collectées (total reçu - principal)
-            uint256 balanceAfter0 = IERC20(token0).balanceOf(address(this));
-            uint256 balanceAfter1 = IERC20(token1).balanceOf(address(this));
-            uint256 totalReceived0 = balanceAfter0 - balanceBefore0;
-            uint256 totalReceived1 = balanceAfter1 - balanceBefore1;
-
-            // Les fees = ce qu'on a reçu en plus du principal de la liquidité
-            uint256 fees0 = totalReceived0 > amount0FromLiq ? totalReceived0 - amount0FromLiq : 0;
-            uint256 fees1 = totalReceived1 > amount1FromLiq ? totalReceived1 - amount1FromLiq : 0;
-
-            // Auto-compound: commission au Treasury, fees nettes restent sur le RM
-            if (fees0 > 0 || fees1 > 0) {
-                uint256 commRate = IMultiUserVault(vault).commissionRate();
-                uint256 commission0 = (fees0 * commRate) / 10000;
-                uint256 commission1 = (fees1 * commRate) / 10000;
-                if (commission0 > 0) IERC20(token0).safeTransfer(treasuryAddress, commission0);
-                if (commission1 > 0) IERC20(token1).safeTransfer(treasuryAddress, commission1);
-                IMultiUserVault(vault).recordFeesCollected(fees0, fees1, commission0, commission1);
-            }
 
             emit TokenWithdrawn(token0, 0, "Liquidity removed for withdrawal");
         }
