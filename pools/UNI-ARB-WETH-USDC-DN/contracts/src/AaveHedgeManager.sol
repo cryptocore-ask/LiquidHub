@@ -125,15 +125,14 @@ contract AaveHedgeManager is ReentrancyGuard {
 
         // If no debt, just send back any USDC collateral proportionally
         if (totalDebt == 0) {
-            if (isFullWithdraw) {
-                // Withdraw all USDC collateral
-                pool.withdraw(address(usdc), type(uint256).max, recipient);
-            } else if (proportionBps > 0) {
-                // Get total collateral to calculate proportional amount
-                (uint256 totalCollateralBase, , , , ,) = pool.getUserAccountData(address(this));
-                if (totalCollateralBase > 0) {
+            // Check if there is any AAVE collateral before attempting withdrawal
+            (uint256 totalCollateralBase, , , , ,) = pool.getUserAccountData(address(this));
+            if (totalCollateralBase > 0) {
+                if (isFullWithdraw) {
+                    // Withdraw all USDC collateral
+                    pool.withdraw(address(usdc), type(uint256).max, recipient);
+                } else if (proportionBps > 0) {
                     // Withdraw proportional USDC collateral
-                    // We use type(uint256).max for full, or calculate proportional
                     uint256 usdcBal = usdc.balanceOf(address(this));
                     pool.withdraw(address(usdc), type(uint256).max, address(this));
                     uint256 totalUsdcWithdrawn = usdc.balanceOf(address(this)) - usdcBal;
@@ -153,7 +152,12 @@ contract AaveHedgeManager is ReentrancyGuard {
             if (wethBal > 0) {
                 weth.safeTransfer(recipient, wethBal);
             }
-            emit SettleProportional(0, proportionBps, recipient, usdc.balanceOf(address(this)));
+            // Send any USDC sitting on this contract (e.g. hedge reserve)
+            uint256 usdcOnContract = usdc.balanceOf(address(this));
+            if (usdcOnContract > 0) {
+                usdc.safeTransfer(recipient, usdcOnContract);
+            }
+            emit SettleProportional(0, proportionBps, recipient, usdcOnContract);
             return;
         }
 
@@ -191,6 +195,15 @@ contract AaveHedgeManager is ReentrancyGuard {
             weth.safeTransfer(recipient, remainingWeth);
         }
 
+        // On full withdraw, sweep any USDC residual (e.g. stuck after a failed borrowMore)
+        // The funds belong to the sole remaining user
+        if (isFullWithdraw) {
+            uint256 usdcResidual = usdc.balanceOf(address(this));
+            if (usdcResidual > 0) {
+                usdc.safeTransfer(recipient, usdcResidual);
+            }
+        }
+
         emit SettleProportional(wethReceived, proportionBps, recipient, 0);
     }
 
@@ -209,19 +222,24 @@ contract AaveHedgeManager is ReentrancyGuard {
         uint256 totalDebt = variableDebtWeth.balanceOf(address(this));
 
         if (totalDebt == 0) {
-            if (isFullWithdraw) {
-                pool.withdraw(address(usdc), type(uint256).max, recipient);
-            } else {
-                uint256 usdcBal = usdc.balanceOf(address(this));
-                pool.withdraw(address(usdc), type(uint256).max, address(this));
-                uint256 totalUsdcWithdrawn = usdc.balanceOf(address(this)) - usdcBal;
-                uint256 proportionalUsdc = (totalUsdcWithdrawn * proportionBps) / 10000;
-                uint256 toResupply = totalUsdcWithdrawn - proportionalUsdc;
-                if (toResupply > 0) pool.supply(address(usdc), toResupply, address(this), 0);
-                if (proportionalUsdc > 0) usdc.safeTransfer(recipient, proportionalUsdc);
+            (uint256 totalCollateralBase, , , , ,) = pool.getUserAccountData(address(this));
+            if (totalCollateralBase > 0) {
+                if (isFullWithdraw) {
+                    pool.withdraw(address(usdc), type(uint256).max, recipient);
+                } else {
+                    uint256 usdcBal = usdc.balanceOf(address(this));
+                    pool.withdraw(address(usdc), type(uint256).max, address(this));
+                    uint256 totalUsdcWithdrawn = usdc.balanceOf(address(this)) - usdcBal;
+                    uint256 proportionalUsdc = (totalUsdcWithdrawn * proportionBps) / 10000;
+                    uint256 toResupply = totalUsdcWithdrawn - proportionalUsdc;
+                    if (toResupply > 0) pool.supply(address(usdc), toResupply, address(this), 0);
+                    if (proportionalUsdc > 0) usdc.safeTransfer(recipient, proportionalUsdc);
+                }
             }
             uint256 wethBal = weth.balanceOf(address(this));
             if (wethBal > 0) weth.safeTransfer(recipient, wethBal);
+            uint256 usdcOnContract = usdc.balanceOf(address(this));
+            if (usdcOnContract > 0) usdc.safeTransfer(recipient, usdcOnContract);
             return;
         }
 
@@ -241,6 +259,12 @@ contract AaveHedgeManager is ReentrancyGuard {
 
         uint256 remainingWeth = weth.balanceOf(address(this));
         if (remainingWeth > 0) weth.safeTransfer(recipient, remainingWeth);
+
+        // On full withdraw, sweep any USDC residual
+        if (isFullWithdraw) {
+            uint256 usdcResidual = usdc.balanceOf(address(this));
+            if (usdcResidual > 0) usdc.safeTransfer(recipient, usdcResidual);
+        }
     }
 
     /// @notice AAVE V3 flash loan callback
@@ -535,8 +559,11 @@ contract AaveHedgeManager is ReentrancyGuard {
             pool.repay(address(weth), wethBalance, 2, address(this));
         }
 
-        // Withdraw all USDC collateral (use max uint to withdraw everything)
-        pool.withdraw(address(usdc), type(uint256).max, address(this));
+        // Withdraw all USDC collateral (only if there is collateral)
+        (uint256 collateralBase, , , , ,) = pool.getUserAccountData(address(this));
+        if (collateralBase > 0) {
+            pool.withdraw(address(usdc), type(uint256).max, address(this));
+        }
 
         // Send all USDC to recipient
         uint256 usdcBalance = usdc.balanceOf(address(this));

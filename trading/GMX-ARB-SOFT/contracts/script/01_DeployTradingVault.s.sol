@@ -9,6 +9,7 @@ contract DeployTradingVault is Script {
         // Lire les variables d'environnement
         address usdc = vm.envAddress("USDC_ADDRESS");
         address gmxExchangeRouter = vm.envAddress("GMX_EXCHANGE_ROUTER");
+        address gmxRouter = vm.envAddress("GMX_ROUTER");
         address gmxOrderVault = vm.envAddress("GMX_ORDER_VAULT");
         address gmxReader = vm.envAddress("GMX_READER");
         address gmxDataStore = vm.envAddress("GMX_DATASTORE");
@@ -29,6 +30,7 @@ contract DeployTradingVault is Script {
         TradingVault vault = new TradingVault(
             usdc,
             gmxExchangeRouter,
+            gmxRouter,
             gmxOrderVault,
             gmxReader,
             gmxDataStore,

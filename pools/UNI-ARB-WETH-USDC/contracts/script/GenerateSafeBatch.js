@@ -25,7 +25,7 @@ const path = require('path');
 const { ethers } = require('ethers');
 
 // Charger le .env de la pool
-require('dotenv').config({ path: path.join(__dirname, '..', '.env') });
+require('dotenv').config({ path: path.join(__dirname, '..', '.env'), override: true });
 
 function requireEnv(key) {
     const val = process.env[key];
@@ -136,7 +136,7 @@ const transactions = [
         },
     },
     {
-        to: VAULT_ADDRESS,
+        to: RANGEMANAGER_ADDRESS,
         value: '0',
         data: rmIface.encodeFunctionData('configurePriceFeeds', [TOKEN0_ORACLE, TOKEN1_ORACLE, ETH_ORACLE]),
         contractMethod: {

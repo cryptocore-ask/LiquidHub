@@ -9,6 +9,11 @@ import "./interfaces/IGmxExchangeRouter.sol";
 import "./interfaces/IGmxReader.sol";
 import "./interfaces/IGmxDataStore.sol";
 
+interface AggregatorV3Interface {
+    function latestRoundData() external view returns (uint80, int256, uint256, uint256, uint80);
+    function decimals() external view returns (uint8);
+}
+
 interface ITreasury {
     function payKeeperBounty(address keeper) external;
 }
@@ -24,6 +29,7 @@ contract TradingVault is Ownable, ReentrancyGuard {
 
     // --- GMX Addresses (mutable — GMX v2 met à jour ses contrats) ---
     address public gmxExchangeRouter;
+    address public gmxRouter;          // Router pour les approvals (pluginTransfer)
     address public gmxOrderVault;
     address public gmxReader;
     address public gmxDataStore;
@@ -74,9 +80,23 @@ contract TradingVault is Ownable, ReentrancyGuard {
         uint256 takeProfitPrice;
         uint256 openTimestamp;
         bool isOpen;
+        address chainlinkFeed;  // Chainlink price feed for SL/TP verification
     }
 
     mapping(bytes32 => Position) public positions;
+
+    // --- Closure Authorization (bot → public keeper relay) ---
+    // Bot authorizes a closure, giving community keepers a 1-minute window to execute it
+    // (and earn the bounty). If no keeper acts within the window, the bot closes itself.
+    struct ClosureAuth {
+        uint64 authorizedAt;   // timestamp of authorization
+        uint64 expiresAt;      // timestamp after which authorization is invalid
+        uint8 closureType;     // 1 = STOP_LOSS, 2 = TAKE_PROFIT
+    }
+    mapping(bytes32 => ClosureAuth) public closureAuthorizations;
+
+    // Duration of the keeper window (public can execute during this window)
+    uint256 public keeperWindow; // default: 60 seconds (1 minute)
     bytes32[] public activePositionKeys;
     uint256 public totalExposureUsd;
     uint256 public totalDeployedCollateral; // Collateral envoyé à GMX (track séparé)
@@ -85,7 +105,8 @@ contract TradingVault is Ownable, ReentrancyGuard {
     struct PendingSettlement {
         bytes32 positionKey;
         uint256 collateralAmount;   // Collateral initial de la position
-        uint256 balanceBefore;      // Balance USDC avant l'ordre de fermeture
+        uint256 entryPrice8dec;     // Entry price in Chainlink 8-decimal format
+        bool isLong;                // Position direction
         uint256 timestamp;          // Quand l'ordre a été créé
         bool settled;               // True une fois la commission prélevée
     }
@@ -113,10 +134,14 @@ contract TradingVault is Ownable, ReentrancyGuard {
     event TakeProfitUpdated(bytes32 indexed key, uint256 newPrice);
     event StopLossExecuted(bytes32 indexed key, address indexed executor, uint256 price);
     event TakeProfitExecuted(bytes32 indexed key, address indexed executor, uint256 price);
+    event ClosureAuthorized(bytes32 indexed key, uint8 closureType, uint64 expiresAt);
+    event ClosureAuthorizationRevoked(bytes32 indexed key);
+    event KeeperWindowUpdated(uint256 oldWindow, uint256 newWindow);
     event PositionLiquidated(bytes32 indexed key, address indexed executor);
     event CommissionPaid(address indexed treasury, uint256 amount);
     event KeeperBountyPaid(address indexed keeper);
     event GmxExchangeRouterUpdated(address indexed oldAddr, address indexed newAddr);
+    event GmxRouterUpdated(address indexed oldAddr, address indexed newAddr);
     event GmxOrderVaultUpdated(address indexed oldAddr, address indexed newAddr);
     event GmxReaderUpdated(address indexed oldAddr, address indexed newAddr);
     event GmxDataStoreUpdated(address indexed oldAddr, address indexed newAddr);
@@ -130,11 +155,14 @@ contract TradingVault is Ownable, ReentrancyGuard {
     event MaxConcurrentPositionsUpdated(uint256 oldMax, uint256 newMax);
     event DepositCooldownUpdated(uint256 oldCooldown, uint256 newCooldown);
     event MinDepositUpdated(uint256 oldMin, uint256 newMin);
+    event TokenRescued(address indexed token, address indexed to, uint256 amount);
 
     // --- Modifiers ---
 
     modifier onlyBot() {
-        require(msg.sender == botModule, "Only bot module");
+        // msg.sender est la Safe (qui fait CALL via execTransactionFromModule)
+        // Le contrôle d'accès du bot est dans le TradingBotModule (onlyBot + allowedFunctions)
+        require(msg.sender == owner(), "Only Safe");
         _;
     }
 
@@ -143,6 +171,7 @@ contract TradingVault is Ownable, ReentrancyGuard {
     constructor(
         address _usdc,
         address _gmxExchangeRouter,
+        address _gmxRouter,
         address _gmxOrderVault,
         address _gmxReader,
         address _gmxDataStore,
@@ -156,6 +185,7 @@ contract TradingVault is Ownable, ReentrancyGuard {
     ) {
         usdc = IERC20(_usdc);
         gmxExchangeRouter = _gmxExchangeRouter;
+        gmxRouter = _gmxRouter;
         gmxOrderVault = _gmxOrderVault;
         gmxReader = _gmxReader;
         gmxDataStore = _gmxDataStore;
@@ -168,6 +198,7 @@ contract TradingVault is Ownable, ReentrancyGuard {
         minDeposit = _minDeposit;
         depositCooldown = 1 hours; // Valeur par défaut, modifiable via setDepositCooldown avant transferOwnership
         keeperBountyEnabled = false;
+        keeperWindow = 60; // 1 minute de priorité aux keepers community (limite le slippage en cas de mouvement de prix)
         lastGlobalTimeUpdate = block.timestamp;
     }
 
@@ -300,6 +331,7 @@ contract TradingVault is Ownable, ReentrancyGuard {
         uint256 executionFee;
         uint256 stopLossPrice;
         uint256 takeProfitPrice;
+        address chainlinkFeed;
     }
 
     function openPosition(
@@ -310,7 +342,8 @@ contract TradingVault is Ownable, ReentrancyGuard {
         uint256 acceptablePrice,
         uint256 executionFee,
         uint256 stopLossPrice,
-        uint256 takeProfitPrice
+        uint256 takeProfitPrice,
+        address chainlinkFeed
     ) external payable onlyBot nonReentrant returns (bytes32) {
         return _openPositionInternal(OpenPositionParams({
             market: market,
@@ -320,7 +353,8 @@ contract TradingVault is Ownable, ReentrancyGuard {
             acceptablePrice: acceptablePrice,
             executionFee: executionFee,
             stopLossPrice: stopLossPrice,
-            takeProfitPrice: takeProfitPrice
+            takeProfitPrice: takeProfitPrice,
+            chainlinkFeed: chainlinkFeed
         }));
     }
 
@@ -334,11 +368,24 @@ contract TradingVault is Ownable, ReentrancyGuard {
         require(p.sizeInUsd / (p.collateralAmount * 1e24) <= maxLeverage, "Max leverage exceeded");
         require(usdc.balanceOf(address(this)) >= p.collateralAmount, "Insufficient idle USDC");
 
-        // Send collateral + execution fee to GMX
-        _sendToGmx(p.collateralAmount, p.executionFee);
+        // Send collateral + execution fee + create order via multicall
+        _sendAndCreateOrder(p);
 
-        // Create order
-        bytes32 key = _createGmxIncreaseOrder(p);
+        // Store position using GMX position key (not order key)
+        // GMX position key = keccak256(account, market, collateralToken, isLong)
+        bytes32 key = keccak256(abi.encode(address(this), p.market, address(usdc), p.isLong));
+
+        // Read entry price from Chainlink (8 decimals) for accurate settlement
+        uint256 entryPrice8dec = 0;
+        if (p.chainlinkFeed != address(0)) {
+            (, int256 answer,,,) = AggregatorV3Interface(p.chainlinkFeed).latestRoundData();
+            if (answer > 0) {
+                uint8 feedDecimals = AggregatorV3Interface(p.chainlinkFeed).decimals();
+                if (feedDecimals == 8) entryPrice8dec = uint256(answer);
+                else if (feedDecimals > 8) entryPrice8dec = uint256(answer) / (10 ** (feedDecimals - 8));
+                else entryPrice8dec = uint256(answer) * (10 ** (8 - feedDecimals));
+            }
+        }
 
         // Store position
         positions[key] = Position({
@@ -346,11 +393,12 @@ contract TradingVault is Ownable, ReentrancyGuard {
             isLong: p.isLong,
             collateralAmount: p.collateralAmount,
             sizeInUsd: p.sizeInUsd,
-            entryPrice: p.acceptablePrice,
+            entryPrice: entryPrice8dec,
             stopLossPrice: p.stopLossPrice,
             takeProfitPrice: p.takeProfitPrice,
             openTimestamp: block.timestamp,
-            isOpen: true
+            isOpen: true,
+            chainlinkFeed: p.chainlinkFeed
         });
 
         activePositionKeys.push(key);
@@ -361,23 +409,20 @@ contract TradingVault is Ownable, ReentrancyGuard {
         return key;
     }
 
-    function _sendToGmx(uint256 collateralAmount, uint256 executionFee) internal {
-        usdc.safeApprove(gmxOrderVault, 0);
-        usdc.safeApprove(gmxOrderVault, collateralAmount);
-        IGmxExchangeRouter(gmxExchangeRouter).sendTokens(
-            address(usdc), gmxOrderVault, collateralAmount
-        );
-        IGmxExchangeRouter(gmxExchangeRouter).sendWnt{value: executionFee}(
-            gmxOrderVault, executionFee
-        );
-    }
+    function _sendAndCreateOrder(OpenPositionParams memory p) internal {
+        // Approve the Router (not ExchangeRouter) because sendTokens() calls
+        // Router.pluginTransfer() which does transferFrom(vault, orderVault, amount)
+        usdc.safeApprove(gmxRouter, 0);
+        usdc.safeApprove(gmxRouter, p.collateralAmount);
 
-    function _createGmxIncreaseOrder(OpenPositionParams memory p) internal returns (bytes32) {
+        // Build multicall data: sendWnt + sendTokens + createOrder in one atomic call
         address[] memory swapPath = new address[](0);
 
-        IGmxExchangeRouter.CreateOrderParams memory params = IGmxExchangeRouter.CreateOrderParams({
+        bytes32[] memory emptyDataList = new bytes32[](0);
+        IGmxExchangeRouter.CreateOrderParams memory orderParams = IGmxExchangeRouter.CreateOrderParams({
             addresses: IGmxExchangeRouter.CreateOrderParamsAddresses({
                 receiver: address(this),
+                cancellationReceiver: address(this),
                 callbackContract: address(0),
                 uiFeeReceiver: address(0),
                 market: p.market,
@@ -391,20 +436,28 @@ contract TradingVault is Ownable, ReentrancyGuard {
                 acceptablePrice: p.acceptablePrice,
                 executionFee: p.executionFee,
                 callbackGasLimit: 0,
-                minOutputAmount: 0
+                minOutputAmount: 0,
+                validFromTime: 0
             }),
             orderType: IGmxExchangeRouter.OrderType.MarketIncrease,
             decreasePositionSwapType: IGmxExchangeRouter.DecreasePositionSwapType.NoSwap,
             isLong: p.isLong,
             shouldUnwrapNativeToken: false,
-            referralCode: bytes32(0)
+            autoCancel: false,
+            referralCode: bytes32(0),
+            dataList: emptyDataList
         });
 
-        return IGmxExchangeRouter(gmxExchangeRouter).createOrder(params);
+        bytes[] memory multicallData = new bytes[](3);
+        multicallData[0] = abi.encodeCall(IGmxExchangeRouter.sendWnt, (gmxOrderVault, p.executionFee));
+        multicallData[1] = abi.encodeCall(IGmxExchangeRouter.sendTokens, (address(usdc), gmxOrderVault, p.collateralAmount));
+        multicallData[2] = abi.encodeCall(IGmxExchangeRouter.createOrder, (orderParams));
+
+        IGmxExchangeRouter(gmxExchangeRouter).multicall{value: p.executionFee}(multicallData);
     }
 
-    function closePosition(bytes32 key) external onlyBot nonReentrant {
-        _closePositionOnGmx(key);
+    function closePosition(bytes32 key, uint256 executionFee) external payable onlyBot nonReentrant {
+        _closePositionOnGmx(key, executionFee);
     }
 
     function updateStopLoss(bytes32 key, uint256 newPrice) external onlyBot {
@@ -421,14 +474,73 @@ contract TradingVault is Ownable, ReentrancyGuard {
         emit TakeProfitUpdated(key, newPrice);
     }
 
+    /**
+     * @notice Authorize public keepers to close a specific position via executeStopLoss/executeTakeProfit.
+     *         Community keepers have a `keeperWindow` seconds priority window to execute (and earn bounty).
+     *         After the window expires, the bot will close itself as a fallback.
+     * @param key Position key
+     * @param closureType 1 = STOP_LOSS, 2 = TAKE_PROFIT
+     */
+    function authorizeClosure(bytes32 key, uint8 closureType) external onlyBot {
+        require(positions[key].isOpen, "Position not open");
+        require(closureType == 1 || closureType == 2, "Invalid closure type");
+
+        uint64 nowTs = uint64(block.timestamp);
+        uint64 expiresAt = nowTs + uint64(keeperWindow);
+
+        closureAuthorizations[key] = ClosureAuth({
+            authorizedAt: nowTs,
+            expiresAt: expiresAt,
+            closureType: closureType
+        });
+
+        emit ClosureAuthorized(key, closureType, expiresAt);
+    }
+
+    /**
+     * @notice Revoke a closure authorization (e.g. if Grok flips during the window).
+     */
+    function revokeClosureAuthorization(bytes32 key) external onlyBot {
+        delete closureAuthorizations[key];
+        emit ClosureAuthorizationRevoked(key);
+    }
+
+    /**
+     * @notice Update the keeper window duration (public priority period after authorization).
+     */
+    function setKeeperWindow(uint256 newWindow) external onlyOwner {
+        require(newWindow >= 30 && newWindow <= 600, "Window must be 30-600s");
+        emit KeeperWindowUpdated(keeperWindow, newWindow);
+        keeperWindow = newWindow;
+    }
+
+    /**
+     * @notice Returns true if a valid closure authorization is active for this key.
+     *         Used by off-chain keepers to filter eligible positions without wasting gas.
+     */
+    function isClosureAuthorized(bytes32 key, uint8 closureType) external view returns (bool) {
+        ClosureAuth memory auth = closureAuthorizations[key];
+        return auth.closureType == closureType
+            && auth.expiresAt >= block.timestamp;
+    }
+
     // ============================================
     // Public Keeper Functions
     // ============================================
 
-    function executeStopLoss(bytes32 key) external nonReentrant {
+    function executeStopLoss(bytes32 key) external payable nonReentrant {
         Position storage pos = positions[key];
         require(pos.isOpen, "Not open");
         require(pos.stopLossPrice > 0, "No SL set");
+
+        // Authorization gating:
+        // - Community keepers can close ONLY during the `keeperWindow` after the bot authorized
+        // - The bot (owner/Safe) can always close (fallback when window expires)
+        if (msg.sender != owner()) {
+            ClosureAuth memory auth = closureAuthorizations[key];
+            require(auth.closureType == 1, "SL not authorized");
+            require(auth.expiresAt >= block.timestamp, "Authorization expired");
+        }
 
         uint256 currentPrice = _getPositionPrice(key);
         if (pos.isLong) {
@@ -437,16 +549,24 @@ contract TradingVault is Ownable, ReentrancyGuard {
             require(currentPrice >= pos.stopLossPrice, "SL not triggered");
         }
 
-        _closePositionOnGmx(key);
+        delete closureAuthorizations[key];
+        _closePositionOnGmx(key, msg.value);
         _payKeeperBounty(msg.sender);
 
         emit StopLossExecuted(key, msg.sender, currentPrice);
     }
 
-    function executeTakeProfit(bytes32 key) external nonReentrant {
+    function executeTakeProfit(bytes32 key) external payable nonReentrant {
         Position storage pos = positions[key];
         require(pos.isOpen, "Not open");
         require(pos.takeProfitPrice > 0, "No TP set");
+
+        // Authorization gating (same as executeStopLoss)
+        if (msg.sender != owner()) {
+            ClosureAuth memory auth = closureAuthorizations[key];
+            require(auth.closureType == 2, "TP not authorized");
+            require(auth.expiresAt >= block.timestamp, "Authorization expired");
+        }
 
         uint256 currentPrice = _getPositionPrice(key);
         if (pos.isLong) {
@@ -455,13 +575,14 @@ contract TradingVault is Ownable, ReentrancyGuard {
             require(currentPrice <= pos.takeProfitPrice, "TP not triggered");
         }
 
-        _closePositionOnGmx(key);
+        delete closureAuthorizations[key];
+        _closePositionOnGmx(key, msg.value);
         _payKeeperBounty(msg.sender);
 
         emit TakeProfitExecuted(key, msg.sender, currentPrice);
     }
 
-    function liquidatePosition(bytes32 key) external nonReentrant {
+    function liquidatePosition(bytes32 key) external payable nonReentrant {
         Position storage pos = positions[key];
         require(pos.isOpen, "Not open");
 
@@ -474,10 +595,37 @@ contract TradingVault is Ownable, ReentrancyGuard {
         uint256 maintenanceMargin = sizeInUsd / 100;
         require(collateral * 1e24 <= maintenanceMargin, "Not liquidatable");
 
-        _closePositionOnGmx(key);
+        _closePositionOnGmx(key, msg.value);
         _payKeeperBounty(msg.sender);
 
         emit PositionLiquidated(key, msg.sender);
+    }
+
+    // ============================================
+    // Order Cancellation Cleanup
+    // ============================================
+
+    /**
+     * Called by bot (via Safe) when a GMX order was cancelled (not executed).
+     * Resets the position tracking and deployed collateral counter.
+     * The USDC has already been returned to the vault by GMX's cancellationReceiver.
+     */
+    function cleanCancelledOrder(bytes32 key) external onlyBot {
+        Position storage pos = positions[key];
+        require(pos.isOpen, "Not open");
+
+        // Verify the position doesn't actually exist on GMX
+        // (if it does, this function should not be called)
+        IGmxReader.PositionProps memory gmxPos = IGmxReader(gmxReader).getPosition(gmxDataStore, key);
+        require(gmxPos.numbers.sizeInUsd == 0, "Position exists on GMX");
+
+        // Clean up
+        pos.isOpen = false;
+        totalExposureUsd -= pos.sizeInUsd;
+        totalDeployedCollateral -= pos.collateralAmount;
+        _removeActivePositionKey(key);
+
+        emit PositionClosed(key);
     }
 
     // ============================================
@@ -494,86 +642,109 @@ contract TradingVault is Ownable, ReentrancyGuard {
         PendingSettlement storage settlement = pendingSettlements[settlementIndex];
         require(!settlement.settled, "Already settled");
 
-        // Vérifier que la position est bien fermée sur GMX (pas d'ordre en attente)
         Position storage pos = positions[settlement.positionKey];
         require(!pos.isOpen, "Position still open");
 
-        uint256 currentBalance = usdc.balanceOf(address(this));
-
-        // Le PnL est la différence entre le balance actuel et ce qu'on avait avant
-        // Plus le collateral qui est revenu (était compté dans totalDeployedCollateral)
-        int256 pnl = int256(currentBalance) - int256(settlement.balanceBefore);
-
-        uint256 commission = 0;
-        if (pnl > 0) {
-            // Profit net = gain total - collateral retourné (déjà compté dans le retour)
-            // Ici pnl > 0 signifie qu'on a reçu plus que ce qu'on avait avant l'envoi de l'ordre
-            // Le collateral faisait déjà partie du vault avant, donc le profit est bien pnl
-            uint256 netProfit = uint256(pnl);
-            if (netProfit > settlement.collateralAmount) {
-                // Le profit réel est au-delà du retour du collateral
-                uint256 tradingProfit = netProfit - settlement.collateralAmount;
-                commission = _handleCommission(tradingProfit);
-            }
-        }
-
-        settlement.settled = true;
-
-        emit SettlementProcessed(settlement.positionKey, pnl, commission);
-
-        // Traiter les retraits en attente maintenant qu'il y a de la liquidité
+        _settleOne(settlement);
         _processWithdrawalQueue();
     }
 
     /**
-     * Settle automatique : le bot appelle cette fonction après chaque fermeture GMX.
-     * Parcourt les settlements non traités et règle ceux dont les USDC sont arrivés.
+     * Settle automatique : parcourt les settlements non traités.
+     * Calcule le PnL via Chainlink et prélève la commission sur les profits.
      */
     function settleAll() external nonReentrant {
-        uint256 currentBalance = usdc.balanceOf(address(this));
-
         for (uint256 i = 0; i < pendingSettlements.length; i++) {
             PendingSettlement storage settlement = pendingSettlements[i];
             if (settlement.settled) continue;
 
             Position storage pos = positions[settlement.positionKey];
-            if (pos.isOpen) continue; // Pas encore fermée
+            if (pos.isOpen) continue;
 
-            // Si le balance a augmenté depuis l'ordre, on peut settle
-            if (currentBalance >= settlement.balanceBefore) {
-                int256 pnl = int256(currentBalance) - int256(settlement.balanceBefore);
-                uint256 commission = 0;
+            // Only settle if enough time has passed (GMX needs ~30s to execute)
+            if (block.timestamp - settlement.timestamp < 60) continue;
 
-                if (pnl > 0 && uint256(pnl) > settlement.collateralAmount) {
-                    uint256 tradingProfit = uint256(pnl) - settlement.collateralAmount;
-                    commission = _handleCommission(tradingProfit);
-                    currentBalance = usdc.balanceOf(address(this)); // Refresh après transfer
-                }
-
-                settlement.settled = true;
-                emit SettlementProcessed(settlement.positionKey, pnl, commission);
-            }
+            _settleOne(settlement);
         }
 
         _processWithdrawalQueue();
+    }
+
+    function _settleOne(PendingSettlement storage settlement) internal {
+        Position storage pos = positions[settlement.positionKey];
+
+        // Read current price from Chainlink to calculate PnL
+        uint256 exitPrice8dec = 0;
+        if (pos.chainlinkFeed != address(0)) {
+            try AggregatorV3Interface(pos.chainlinkFeed).latestRoundData() returns (uint80, int256 answer, uint256, uint256, uint80) {
+                if (answer > 0) {
+                    uint8 feedDecimals = AggregatorV3Interface(pos.chainlinkFeed).decimals();
+                    if (feedDecimals == 8) exitPrice8dec = uint256(answer);
+                    else if (feedDecimals > 8) exitPrice8dec = uint256(answer) / (10 ** (feedDecimals - 8));
+                    else exitPrice8dec = uint256(answer) * (10 ** (8 - feedDecimals));
+                }
+            } catch {
+                // Can't read price — skip settlement (will retry later)
+                return;
+            }
+        }
+
+        uint256 commission = 0;
+
+        if (exitPrice8dec > 0 && settlement.entryPrice8dec > 0) {
+            // Calculate if trade was profitable
+            bool profitable;
+            uint256 priceChange8dec;
+
+            if (settlement.isLong) {
+                profitable = exitPrice8dec > settlement.entryPrice8dec;
+                priceChange8dec = profitable
+                    ? exitPrice8dec - settlement.entryPrice8dec
+                    : settlement.entryPrice8dec - exitPrice8dec;
+            } else {
+                profitable = exitPrice8dec < settlement.entryPrice8dec;
+                priceChange8dec = profitable
+                    ? settlement.entryPrice8dec - exitPrice8dec
+                    : exitPrice8dec - settlement.entryPrice8dec;
+            }
+
+            if (profitable) {
+                // PnL in USDC = collateral * priceChange / entryPrice * leverage
+                // Since leverage = sizeInUsd / (collateral * 1e24), and sizeInUsd is in 30 dec:
+                // Simplified: profit_usdc = collateral * priceChange / entryPrice
+                // (leverage is already factored into sizeInUsd)
+                uint256 sizeInUsd = pos.sizeInUsd;
+                // profitUsdc = sizeInUsd * priceChange / entryPrice / 1e24 (to get 6 dec USDC)
+                uint256 profitUsdc = (sizeInUsd * priceChange8dec) / settlement.entryPrice8dec / 1e24;
+                commission = _handleCommission(profitUsdc);
+            }
+        }
+
+        settlement.settled = true;
+        emit SettlementProcessed(settlement.positionKey, int256(exitPrice8dec), commission);
     }
 
     // ============================================
     // Internal Functions
     // ============================================
 
-    function _closePositionOnGmx(bytes32 key) internal {
+    function _closePositionOnGmx(bytes32 key, uint256 executionFee) internal {
         Position storage pos = positions[key];
         require(pos.isOpen, "Not open");
 
-        uint256 balanceBefore = usdc.balanceOf(address(this));
-
-        // Create decrease order on GMX (asynchrone — les USDC arrivent plus tard)
+        // Create decrease order on GMX via multicall (sendWnt + createOrder)
         address[] memory swapPath = new address[](0);
 
+        // For close: acceptablePrice depends on direction
+        // Long close (sell): acceptablePrice = 0 (accept any price, we want to sell)
+        // Short close (buy back): acceptablePrice = type(uint256).max (accept any price, we want to buy)
+        uint256 closeAcceptablePrice = pos.isLong ? 0 : type(uint256).max;
+
+        bytes32[] memory emptyDataList = new bytes32[](0);
         IGmxExchangeRouter.CreateOrderParams memory params = IGmxExchangeRouter.CreateOrderParams({
             addresses: IGmxExchangeRouter.CreateOrderParamsAddresses({
                 receiver: address(this),
+                cancellationReceiver: address(this),
                 callbackContract: address(0),
                 uiFeeReceiver: address(0),
                 market: pos.market,
@@ -584,19 +755,26 @@ contract TradingVault is Ownable, ReentrancyGuard {
                 sizeDeltaUsd: pos.sizeInUsd,
                 initialCollateralDeltaAmount: pos.collateralAmount,
                 triggerPrice: 0,
-                acceptablePrice: 0,
-                executionFee: 0,
+                acceptablePrice: closeAcceptablePrice,
+                executionFee: executionFee,
                 callbackGasLimit: 0,
-                minOutputAmount: 0
+                minOutputAmount: 0,
+                validFromTime: 0
             }),
             orderType: IGmxExchangeRouter.OrderType.MarketDecrease,
             decreasePositionSwapType: IGmxExchangeRouter.DecreasePositionSwapType.SwapPnlTokenToCollateralToken,
             isLong: pos.isLong,
             shouldUnwrapNativeToken: false,
-            referralCode: bytes32(0)
+            autoCancel: false,
+            referralCode: bytes32(0),
+            dataList: emptyDataList
         });
 
-        IGmxExchangeRouter(gmxExchangeRouter).createOrder(params);
+        bytes[] memory multicallData = new bytes[](2);
+        multicallData[0] = abi.encodeCall(IGmxExchangeRouter.sendWnt, (gmxOrderVault, executionFee));
+        multicallData[1] = abi.encodeCall(IGmxExchangeRouter.createOrder, (params));
+
+        IGmxExchangeRouter(gmxExchangeRouter).multicall{value: executionFee}(multicallData);
 
         // Marquer la position comme fermée
         pos.isOpen = false;
@@ -608,7 +786,8 @@ contract TradingVault is Ownable, ReentrancyGuard {
         pendingSettlements.push(PendingSettlement({
             positionKey: key,
             collateralAmount: pos.collateralAmount,
-            balanceBefore: balanceBefore,
+            entryPrice8dec: pos.entryPrice,  // Stored in Chainlink 8-decimal format
+            isLong: pos.isLong,
             timestamp: block.timestamp,
             settled: false
         }));
@@ -721,11 +900,20 @@ contract TradingVault is Ownable, ReentrancyGuard {
     }
 
     function _getPositionPrice(bytes32 key) internal view returns (uint256) {
-        IGmxReader.PositionProps memory gmxPos = IGmxReader(gmxReader).getPosition(gmxDataStore, key);
-        uint256 sizeInUsd = gmxPos.numbers.sizeInUsd;
-        uint256 sizeInTokens = gmxPos.numbers.sizeInTokens;
-        require(sizeInTokens > 0, "Invalid position");
-        return sizeInUsd * 1e18 / sizeInTokens;
+        Position storage pos = positions[key];
+        require(pos.chainlinkFeed != address(0), "No Chainlink feed");
+
+        // Read current price from Chainlink feed and normalize to 8 decimals
+        (, int256 answer,,,) = AggregatorV3Interface(pos.chainlinkFeed).latestRoundData();
+        require(answer > 0, "Invalid Chainlink price");
+        uint8 feedDecimals = AggregatorV3Interface(pos.chainlinkFeed).decimals();
+        if (feedDecimals == 8) {
+            return uint256(answer);
+        } else if (feedDecimals > 8) {
+            return uint256(answer) / (10 ** (feedDecimals - 8));
+        } else {
+            return uint256(answer) * (10 ** (8 - feedDecimals));
+        }
     }
 
     function _removeActivePositionKey(bytes32 key) internal {
@@ -801,6 +989,12 @@ contract TradingVault is Ownable, ReentrancyGuard {
         gmxExchangeRouter = _new;
     }
 
+    function setGmxRouter(address _new) external onlyOwner {
+        require(_new != address(0), "Invalid address");
+        emit GmxRouterUpdated(gmxRouter, _new);
+        gmxRouter = _new;
+    }
+
     function setGmxOrderVault(address _new) external onlyOwner {
         require(_new != address(0), "Invalid address");
         emit GmxOrderVaultUpdated(gmxOrderVault, _new);
@@ -861,9 +1055,15 @@ contract TradingVault is Ownable, ReentrancyGuard {
 
     // --- Emergency ---
 
+    /// @notice Recover non-protected tokens (airdrops, erroneous transfers, donations)
+    /// @dev Blocks usdc (user funds, cannot be moved). Destination is flexible:
+    ///      refund the sender, send to Treasury, or keep for protocol use depending on context.
+    ///      Each rescue emits TokenRescued for full on-chain traceability.
     function rescueToken(address token, uint256 amount, address to) external onlyOwner {
+        require(token != address(usdc), "Protected");
         require(to != address(0), "Invalid recipient");
         IERC20(token).safeTransfer(to, amount);
+        emit TokenRescued(token, to, amount);
     }
 
     function rescueETH(uint256 amount, address payable to) external onlyOwner {

@@ -15,7 +15,7 @@ async function main() {
   console.log(`Check interval: ${CHECK_INTERVAL_MS / 60000} minutes`);
   console.log(`Mode: ${CHECK_ONLY ? 'CHECK ONLY' : 'ACTIVE'}\n`);
 
-  // Validate required env vars
+  // Validate required env vars (VAULT_ADDRESS kept for Treasury discovery)
   const required = ['RPC_URL', 'RANGEMANAGER_ADDRESS', 'VAULT_ADDRESS', 'TOKEN0_ADDRESS', 'TOKEN1_ADDRESS'];
   if (!CHECK_ONLY) required.push('KEEPER_PRIVATE_KEY');
   for (const key of required) {

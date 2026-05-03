@@ -25,14 +25,17 @@ The bot operates through a **Safe Module** that restricts which functions can be
 | Function | Access | Description |
 |----------|--------|-------------|
 | `openPosition(...)` | Bot only (via module) | Open a new position on GMX |
-| `closePosition(bytes32)` | Bot only (via module) | Close an existing position |
+| `closePosition(bytes32)` | Bot only (via module) | Close an existing position (admin/manual) |
 | `updateStopLoss(bytes32,uint256)` | Bot only (via module) | Update stop-loss price |
 | `updateTakeProfit(bytes32,uint256)` | Bot only (via module) | Update take-profit price |
-| `executeStopLoss(bytes32)` | **Public** (keeper) | Execute SL when triggered |
-| `executeTakeProfit(bytes32)` | **Public** (keeper) | Execute TP when triggered |
-| `liquidatePosition(bytes32)` | **Public** (keeper) | Liquidate when conditions met |
+| `authorizeClosure(bytes32,uint8)` | Bot only (via module) | Authorize keepers to execute SL/TP for `keeperWindow` seconds |
+| `revokeClosureAuthorization(bytes32)` | Bot only (via module) | Revoke a previously issued closure authorization |
+| `executeStopLoss(bytes32)` | **Public** (keeper, gated) | Execute SL — requires active authorization OR owner |
+| `executeTakeProfit(bytes32)` | **Public** (keeper, gated) | Execute TP — requires active authorization OR owner |
+| `liquidatePosition(bytes32)` | **Public** (keeper, permissionless) | Liquidate when under maintenance margin |
 | `deposit(uint256)` | **Public** (user) | Deposit USDC |
 | `withdraw(uint256)` | **Public** (user) | Withdraw USDC |
+| `setKeeperWindow(uint256)` | **Owner only** (Safe) | Configure keeper priority window (30-600s) |
 | `set*` functions | **Owner only** (Safe) | Administrative configuration |
 
 The module also enforces:

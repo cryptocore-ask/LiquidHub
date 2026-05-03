@@ -16,6 +16,7 @@ contract SecureBotModule {
     address public immutable rangeManager;
     address public immutable vault;
     address public immutable hedgeManager;
+    address public immutable treasury;
     address public owner;
     
     // Sécurité renforcée
@@ -38,6 +39,7 @@ contract SecureBotModule {
         address _rangeManager,
         address _vault,
         address _hedgeManager,
+        address _treasury,
         uint256 _dailyLimit
     ) {
         safe = _safe;
@@ -45,6 +47,7 @@ contract SecureBotModule {
         rangeManager = _rangeManager;
         vault = _vault;
         hedgeManager = _hedgeManager;
+        treasury = _treasury;
         owner = _safe; // La Safe est owner
         dailyLimit = _dailyLimit;
         
@@ -81,6 +84,10 @@ contract SecureBotModule {
         allowedFunctions[0xb575e123] = true; // emergencyClose(address)
         allowedFunctions[0xacf31cb1] = true; // sweepWeth(address)
         allowedFunctions[0x58ea510a] = true; // sweepUsdc(address)
+
+        // Fonctions Treasury (bridge Stargate v2 vers staking contract Phase 2)
+        allowedFunctions[0xa5599124] = true; // bridgeToStakers(uint256)
+        allowedFunctions[0x1dc28748] = true; // collectAndBridge(address,uint24,uint256,uint256)
     }
     
     modifier onlyBot() {
@@ -148,6 +155,42 @@ contract SecureBotModule {
         withinDailyLimit
     {
         bool success = ISafe(safe).execTransactionFromModule(hedgeManager, 0, data, 0);
+        require(success, "Execution failed");
+
+        bytes4 selector = bytes4(data[:4]);
+        emit FunctionExecuted(selector, dailySpent);
+    }
+
+    /// @notice Execute a Treasury function (bridge operations only, per whitelist)
+    function executeTreasuryFunction(bytes calldata data)
+        external
+        onlyBot
+        onlyAllowedFunction(data)
+        withinDailyLimit
+    {
+        bool success = ISafe(safe).execTransactionFromModule(treasury, 0, data, 0);
+        require(success, "Execution failed");
+
+        bytes4 selector = bytes4(data[:4]);
+        emit FunctionExecuted(selector, dailySpent);
+    }
+
+    /// @notice Execute a Treasury function with native ETH value (Stargate cross-chain fees)
+    /// @dev The bot forwards ETH with msg.value; the module funds the Safe then calls Treasury.
+    function executeTreasuryFunctionWithValue(bytes calldata data, uint256 value)
+        external
+        payable
+        onlyBot
+        onlyAllowedFunction(data)
+        withinDailyLimit
+    {
+        require(msg.value >= value, "Insufficient ETH sent");
+
+        // Forward ETH to Safe so it can fund the Treasury call
+        (bool sent,) = safe.call{value: value}("");
+        require(sent, "ETH transfer to Safe failed");
+
+        bool success = ISafe(safe).execTransactionFromModule(treasury, value, data, 0);
         require(success, "Execution failed");
 
         bytes4 selector = bytes4(data[:4]);

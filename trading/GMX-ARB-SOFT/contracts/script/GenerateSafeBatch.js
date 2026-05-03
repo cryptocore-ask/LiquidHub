@@ -22,7 +22,7 @@ const path = require('path');
 const { ethers } = require('ethers');
 
 // Charger le .env du service trading
-require('dotenv').config({ path: path.join(__dirname, '..', '.env') });
+require('dotenv').config({ path: path.join(__dirname, '..', '.env'), override: true });
 
 function requireEnv(key) {
     const val = process.env[key];

@@ -12,17 +12,24 @@ The keeper bot follows a simple loop:
 
 ### Rebalance Flow
 
-When a rebalance is needed, the bot executes the following on-chain transactions:
+When a rebalance is needed, the bot submits a single atomic transaction to `rebalance()` on the RangeManager. The contract performs all steps in one call:
 
-1. **Lock vault** - `startRebalance()` on MultiUserVault (prevents deposits/withdrawals during rebalance)
-2. **Burn position** - `burnPosition(tokenId)` on RangeManager (removes liquidity and collects fees)
-3. **Swap tokens** - `executeSwap()` on RangeManager (rebalances token ratio for the new range). Large swaps are automatically split into multiple chunks based on `INIT_MULTI_SWAP_TVL`.
-4. **Mint position** - `mintInitialPosition()` on RangeManager (creates new position in the updated range)
-5. **Unlock vault** - `endRebalance()` on MultiUserVault (re-enables deposits/withdrawals)
+1. **Lock vault** — prevents deposits/withdrawals during rebalance
+2. **Burn old position** — removes liquidity and collects accrued fees
+3. **Execute swaps** — rebalances token ratio for the new range. Large swaps are automatically split into N chunks ≤ `initMultiSwapTvl` (read from the contract).
+4. **Mint new position** — creates a new position centered on the current price
+5. **Unlock vault** — re-enables deposits/withdrawals
+6. **Pay keeper bounty** — if bounty is enabled, USDC is sent to the keeper
+
+Everything happens atomically: if any step fails, the whole transaction reverts and no partial state is left on-chain.
 
 ### Range Configuration
 
-Ranges are configured **on-chain by the Safe multisig** (pool owner). The keeper bot does not set or modify ranges -- it only executes rebalances when the on-chain configuration indicates one is needed.
+Ranges are configured **on-chain by the Safe multisig** (pool owner). The keeper bot does not set or modify ranges — it only executes rebalances when `getBotInstructions()` indicates one is needed.
+
+### Permissionless
+
+`rebalance()` is fully permissionless — any address can call it when the contract agrees a rebalance is needed. No whitelisting or keeper role required.
 
 ## Setup
 
@@ -81,18 +88,18 @@ The bot displays bounty status on startup.
 ## Requirements
 
 - **Node.js 18+**
-- **Funded wallet** - The keeper wallet needs ETH on Arbitrum for gas fees. Typical rebalance costs 5-6 transactions.
-- **Keeper role** - The wallet must be granted the keeper role on the RangeManager contract by the Safe.
+- **Funded wallet** — The keeper wallet needs ETH on Arbitrum for gas fees. Each rebalance is a single atomic transaction (the contract performs burn + swaps + mint internally).
+- **No permission required** — `rebalance()` is public; any address can call it when a rebalance is needed.
 
 ## Security
 
-The keeper bot operates with minimal permissions:
+The keeper bot is fully permissionless and operates with no special privileges:
 
-- It can **only** call whitelisted functions on the RangeManager and Vault contracts
-- It **cannot** access, transfer, or withdraw user funds
-- It **cannot** modify range parameters or pool configuration
+- `rebalance()` is a public function — anyone can call it, but only when the contract agrees a rebalance is needed (`getBotInstructions()` returns `needsRebalance = true`)
+- The keeper **cannot** access, transfer, or withdraw user funds
+- The keeper **cannot** modify range parameters or pool configuration
 - All privileged operations (range settings, fee parameters, emergency actions) are restricted to the Safe multisig
-- The keeper role can be revoked at any time by the Safe
+- Per-swap size is capped on-chain by `initMultiSwapTvl` to protect against slippage attacks
 
 ## Architecture
 

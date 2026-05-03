@@ -144,6 +144,7 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
     event TreasuryAddressUpdated(address indexed oldTreasury, address indexed newTreasury);
     event ExecutorAuthorizedOnRangeManager(address indexed executor, bool authorized);
     event BotModuleUpdated(address indexed oldModule, address indexed newModule);
+    event TokenRescued(address indexed token, address indexed to, uint256 amount);
     
     // ===== MODIFIERS =====
     
@@ -331,8 +332,9 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
             uint256 depositValue = _calculateDepositValue(pd.amount0, pd.amount1);
             uint256 sharesToMint;
             
-            if (totalShares == 0) {
-                // Premier dépôt : brûler DEAD_SHARES pour empêcher l'inflation attack
+            if (totalShares <= DEAD_SHARES) {
+                // Premier dépôt (ou re-dépôt après withdraw total, ne reste que les dead shares)
+                totalShares = 0; // Reset pour recalculer proprement
                 sharesToMint = depositValue * 1e10;
                 require(sharesToMint > DEAD_SHARES, "First deposit too small");
                 sharesToMint -= DEAD_SHARES;
@@ -440,7 +442,9 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
         uint256 depositValue = _calculateDepositValue(pd.amount0, pd.amount1);
         uint256 sharesToMint;
 
-        if (totalShares == 0) {
+        if (totalShares <= DEAD_SHARES) {
+            // Premier dépôt (ou re-dépôt après withdraw total, ne reste que les dead shares)
+            totalShares = 0; // Reset pour recalculer proprement
             sharesToMint = depositValue * 1e10;
             require(sharesToMint > DEAD_SHARES, "First deposit too small");
             sharesToMint -= DEAD_SHARES;
@@ -1170,7 +1174,21 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
         botModule = _module;
         emit BotModuleUpdated(oldModule, _module);
     }
-    
+
+    /// @notice Recover non-protected tokens (airdrops, erroneous transfers, donations)
+    /// @dev Blocks token0/token1 (user funds, cannot be moved). Destination is flexible:
+    ///      refund the sender, send to Treasury, or keep for protocol use depending on context.
+    ///      Each rescue emits TokenRescued for full on-chain traceability.
+    /// @param tokenAddr Token to rescue (must not be token0 or token1)
+    /// @param to Recipient address
+    /// @param amount Amount to rescue
+    function rescueToken(address tokenAddr, address to, uint256 amount) external onlyOwner {
+        require(tokenAddr != address(token0) && tokenAddr != address(token1), "Protected");
+        require(to != address(0), "Invalid recipient");
+        IERC20(tokenAddr).safeTransfer(to, amount);
+        emit TokenRescued(tokenAddr, to, amount);
+    }
+
     // ===== FONCTIONS DE VUE =====
     
     function getCommissionStats() external view returns (

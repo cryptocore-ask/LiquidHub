@@ -100,12 +100,8 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
     address public treasuryAddress;
 
     // ===== DELTA NEUTRAL HEDGE =====
-    // Ratio de reserve pour le collatéral AAVE V3 (en basis points, ex: 6250 = 62.5%)
-    // Stratégie 75/25 : 62.5% réservé pour collatéral AAVE, 37.5% USDC vers LP + emprunt WETH
-    // Si > 0, le vault retient ce pourcentage de token1 (USDC) des dépôts comme réserve hedge
-    uint16 public hedgeReserveRatioBps;
-    // Total USDC réservées dans le vault pour le hedge (non envoyées en LP)
-    uint256 public reservedCollateral;
+    // Le collatéral AAVE est calculé dynamiquement par le bot via H_opt
+    // Le vault envoie tout l'USDC au RangeManager, le bot gère la répartition AAVE/LP
     
     //securbotmodule
     address public botModule;
@@ -170,9 +166,8 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
     event TreasuryAddressUpdated(address indexed oldTreasury, address indexed newTreasury);
     event ExecutorAuthorizedOnRangeManager(address indexed executor, bool authorized);
     event BotModuleUpdated(address indexed oldModule, address indexed newModule);
-    event HedgeReserveRatioUpdated(uint16 oldRatio, uint16 newRatio);
-    event ReservedCollateralWithdrawn(uint256 amount, address indexed to);
-    event CollateralReserved(uint256 amount, uint256 totalReserved);
+    event TokenRescued(address indexed token, address indexed to, uint256 amount);
+    // Events hedge reserve supprimés (H_opt: bot gère la répartition)
     event HedgeManagerSet(address indexed hedgeManager);
     
     // ===== MODIFIERS =====
@@ -195,13 +190,11 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
         address _token1,
         address _treasuryAddress,
         uint256 _commissionRate,
-        uint256 _minDepositUSD,
-        uint16 _hedgeReserveRatioBps
+        uint256 _minDepositUSD
     ) {
         if (_rangeManager == address(0)) revert E11();
         if (_token0 == address(0) || _token1 == address(0)) revert E12();
         if (_treasuryAddress == address(0)) revert E13();
-        if (_hedgeReserveRatioBps > 7000) revert E50();
 
         rangeManager = IRangeManager(_rangeManager);
         token0 = IERC20(_token0);
@@ -211,8 +204,6 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
 
         commissionRate = _commissionRate;
         if (commissionRate > 3000) revert E14();
-
-        hedgeReserveRatioBps = _hedgeReserveRatioBps;
 
         minDepositUSD = _minDepositUSD;
 
@@ -308,7 +299,8 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
     
     function deposit(uint256 amount0, uint256 amount1) external nonReentrant {
         if (amount0 == 0 && amount1 == 0) revert E21();
-        if (hedgeReserveRatioBps > 0 && amount0 > 0) revert E70();
+        // DN pools: dépôts USDC uniquement (token0/WETH non accepté en dépôt direct)
+        if (hedgeManager != address(0) && amount0 > 0) revert E70();
         if (hasPendingDeposit[msg.sender]) revert E22();
         
         // Vérifier le montant minimum seulement si > 0
@@ -362,8 +354,9 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
             uint256 depositValue = _calculateDepositValue(pd.amount0, pd.amount1);
             uint256 sharesToMint;
             
-            if (totalShares == 0) {
-                // Premier dépôt : brûler DEAD_SHARES pour empêcher l'inflation attack
+            if (totalShares <= DEAD_SHARES) {
+                // Premier dépôt (ou re-dépôt après withdraw total, ne reste que les dead shares)
+                totalShares = 0; // Reset pour recalculer proprement
                 sharesToMint = depositValue * 1e10;
                 if (sharesToMint <= DEAD_SHARES) revert E24(); // "First deposit too small"
                 sharesToMint -= DEAD_SHARES;
@@ -417,19 +410,12 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
             emit Deposit(pd.user, pd.amount0, pd.amount1, sharesToMint);
         }
         
-        // Envoyer les fonds au RangeManager (réserver la part hedge AAVE)
-        uint256 hedgeReserve = _calculateHedgeReserve(totalDepositValueUSD, totalAmount1);
-        uint256 amount1ToLP = totalAmount1 - hedgeReserve;
-        if (hedgeReserve > 0) {
-            reservedCollateral += hedgeReserve;
-            emit CollateralReserved(hedgeReserve, reservedCollateral);
-        }
-
+        // Envoyer tous les fonds au RangeManager (le bot gère la répartition AAVE/LP via H_opt)
         if (totalAmount0 > 0) {
             token0.safeTransfer(address(rangeManager), totalAmount0);
         }
-        if (amount1ToLP > 0) {
-            token1.safeTransfer(address(rangeManager), amount1ToLP);
+        if (totalAmount1 > 0) {
+            token1.safeTransfer(address(rangeManager), totalAmount1);
         }
 
         // Vider la queue
@@ -479,7 +465,9 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
         uint256 depositValue = _calculateDepositValue(pd.amount0, pd.amount1);
         uint256 sharesToMint;
 
-        if (totalShares == 0) {
+        if (totalShares <= DEAD_SHARES) {
+            // Premier dépôt (ou re-dépôt après withdraw total, ne reste que les dead shares)
+            totalShares = 0; // Reset pour recalculer proprement
             sharesToMint = depositValue * 1e10;
             if (sharesToMint <= DEAD_SHARES) revert E24(); // "First deposit too small"
             sharesToMint -= DEAD_SHARES;
@@ -519,19 +507,12 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
         totalShares += sharesToMint;
         hasPendingDeposit[pd.user] = false;
 
-        // Envoyer les fonds de CE DEPOT au RangeManager (réserver la part hedge AAVE)
-        uint256 singleHedgeReserve = _calculateHedgeReserve(depositValue, pd.amount1);
-        uint256 amount1ToLP = pd.amount1 - singleHedgeReserve;
-        if (singleHedgeReserve > 0) {
-            reservedCollateral += singleHedgeReserve;
-            emit CollateralReserved(singleHedgeReserve, reservedCollateral);
-        }
-
+        // Envoyer tous les fonds de CE DEPOT au RangeManager (bot gère la répartition via H_opt)
         if (pd.amount0 > 0) {
             token0.safeTransfer(address(rangeManager), pd.amount0);
         }
-        if (amount1ToLP > 0) {
-            token1.safeTransfer(address(rangeManager), amount1ToLP);
+        if (pd.amount1 > 0) {
+            token1.safeTransfer(address(rangeManager), pd.amount1);
         }
 
         // Retirer ce dépôt de la queue (shift array)
@@ -613,7 +594,7 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
         _executeWithdrawFromRange(principal0, principal1, address(this), vaultSharesPercent);
 
         // Step 2: Settle AAVE hedge if DN pool
-        if (hedgeReserveRatioBps > 0 && hedgeManager != address(0)) {
+        if (hedgeManager != address(0)) {
             uint256 wethBal = token0.balanceOf(address(this));
             if (wethBal > 0) {
                 token0.safeTransfer(hedgeManager, wethBal);
@@ -781,21 +762,8 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
 
     /**
      * @notice Calcule le montant de USDC à réserver pour le hedge AAVE
-     * @param depositValueUSD Valeur USD du dépôt (8 decimals Chainlink)
-     * @param amount1Available Montant de token1 (USDC) disponible
-     * @return reserveAmount Montant de USDC à réserver
+     * @notice _calculateHedgeReserve supprimée — le bot gère la répartition AAVE/LP via H_opt
      */
-    function _calculateHedgeReserve(uint256 depositValueUSD, uint256 amount1Available) private view returns (uint256) {
-        if (hedgeReserveRatioBps == 0 || depositValueUSD == 0 || amount1Available == 0) return 0;
-        (,,,,, bool priceValid) = rangeManager.priceCache();
-        if (!priceValid) return 0;
-        (, uint128 price1,,,,) = rangeManager.priceCache();
-        RangeOperations.RangeConfig memory cfg = rangeManager.config();
-        uint256 reserveUSD = (depositValueUSD * hedgeReserveRatioBps) / 10000;
-        uint256 reserveAmount = (reserveUSD * (10 ** cfg.token1Decimals)) / uint256(price1);
-        if (reserveAmount > amount1Available) reserveAmount = amount1Available;
-        return reserveAmount;
-    }
     
     function getCurrentPortfolioValue() public view returns (uint256) {
         try rangeManager.getCurrentBalances() returns (uint256 bal0, uint256 bal1) {
@@ -1182,35 +1150,24 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
         emit HedgeManagerSet(_hedgeManager);
     }
 
+    /// @notice Recover non-protected tokens (airdrops, erroneous transfers, donations)
+    /// @dev Blocks token0/token1 (user funds, cannot be moved). Destination is flexible:
+    ///      refund the sender, send to Treasury, or keep for protocol use depending on context.
+    ///      Each rescue emits TokenRescued for full on-chain traceability.
+    /// @param tokenAddr Token to rescue (must not be token0 or token1)
+    /// @param to Recipient address
+    /// @param amount Amount to rescue
+    function rescueToken(address tokenAddr, address to, uint256 amount) external onlyOwner {
+        require(tokenAddr != address(token0) && tokenAddr != address(token1), "Protected");
+        require(to != address(0), "Invalid recipient");
+        IERC20(tokenAddr).safeTransfer(to, amount);
+        emit TokenRescued(tokenAddr, to, amount);
+    }
+
     // ===== DELTA NEUTRAL HEDGE FUNCTIONS =====
 
-    /**
-     * @notice Met à jour le ratio de réserve hedge
-     * @param _newRatio Nouveau ratio en basis points (ex: 2000 = 20%, 0 = désactivé)
-     */
-    function setHedgeReserveRatio(uint16 _newRatio) external onlyOwner {
-        if (_newRatio > 7000) revert E50();
-        uint16 oldRatio = hedgeReserveRatioBps;
-        hedgeReserveRatioBps = _newRatio;
-        emit HedgeReserveRatioUpdated(oldRatio, _newRatio);
-    }
-
-    /**
-     * @notice Retire le collatéral réservé pour l'envoyer au AaveHedgeManager
-     * @dev Appelable uniquement par le bot (via Safe module) pour envoyer les USDC au hedge manager
-     * @param amount Montant de token1 (USDC) à retirer
-     * @param to Adresse de destination (AaveHedgeManager)
-     */
-    function withdrawReservedCollateral(uint256 amount, address to) external onlyBot {
-        if (amount == 0) revert E51();
-        if (amount > reservedCollateral) revert E52();
-        if (to == address(0)) revert E53();
-
-        reservedCollateral -= amount;
-        token1.safeTransfer(to, amount);
-
-        emit ReservedCollateralWithdrawn(amount, to);
-    }
+    // setHedgeReserveRatio et withdrawReservedCollateral supprimés
+    // Le bot gère la répartition AAVE/LP via H_opt et sendTokenForHedge sur le RangeManager
 
     /**
      * @notice Retourne le montant de collatéral réservé disponible
@@ -1295,7 +1252,7 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
         uint256 vaultSharesPercent = totalSharesBefore > 0 ? (userShares * 10000) / totalSharesBefore : 0;
         bool isFullWithdraw = vaultSharesPercent >= 9999;
 
-        if (hedgeReserveRatioBps > 0 && hedgeManager != address(0) && userShares > 0) {
+        if (hedgeManager != address(0) && userShares > 0) {
             uint256 wethForRepay = token0.balanceOf(address(this));
             if (wethForRepay > 0) {
                 token0.safeTransfer(hedgeManager, wethForRepay);
@@ -1310,7 +1267,7 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
         uint256 bal1 = token1.balanceOf(address(this));
         uint256 toSend0;
         uint256 toSend1;
-        if (hedgeReserveRatioBps > 0 && hedgeManager != address(0)) {
+        if (hedgeManager != address(0)) {
             // DN: envoyer tout le solde vault (plus de commissions en attente avec auto-compound)
             toSend0 = bal0;
             toSend1 = bal1;
@@ -1337,35 +1294,26 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
      * @notice - Burn le NFT en cas de problème sur la position
      * @dev Les fonds restent dans RangeManager apres le burn en attente d'un nouveau MINT
      */
-    function EmergencyBurnPositions() external onlyOwner nonReentrant {
+    function EmergencyBurnPositions() external onlyOwner {
         // 1. Recuperer toutes les positions NFT
         uint256[] memory positions = rangeManager.getOwnerPositions();
-        
+
         if (positions.length == 0) {
             revert("E46");
         }
-        
+
         // 2. Pour chaque position, retirer la liquidite puis burn le NFT
         for (uint256 i = 0; i < positions.length; i++) {
             uint256 tokenId = positions[i];
-            
-            // Appeler la fonction burnPosition dans RangeManager
-            // Cette fonction doit retirer la liquidite et burn le NFT
-            try IRangeManager(address(rangeManager)).burnPosition(tokenId) {
-                emit PositionBurned(tokenId, msg.sender);
-            } catch Error(string memory reason) {
-                emit BurnFailed(tokenId, reason);
-            } catch {
-                emit BurnFailed(tokenId, "Unknown error");
-            }
+
+            // Appeler burnPosition directement (pas de try/catch pour voir les erreurs)
+            IRangeManager(address(rangeManager)).burnPosition(tokenId);
+            emit PositionBurned(tokenId, msg.sender);
         }
-        
+
         // 3. Les fonds restent dans RangeManager
-        // Pas de transfert vers le vault ou la safe
-        
-        // 4. Conserver l'association avec les utilisateurs
-        // Les userInfo restent intacts pour tracer qui a depose quoi
-        
+        // 4. Les userInfo restent intacts
+
         emit AllPositionsBurned(positions.length, msg.sender);
     }
 

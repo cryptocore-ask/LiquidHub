@@ -113,6 +113,7 @@ contract DeployContracts is Script {
             botAddress,
             address(rangeManager),
             address(vault),
+            treasuryAddress,
             dailyLimit
         );
 

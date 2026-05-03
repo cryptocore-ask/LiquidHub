@@ -872,7 +872,21 @@ contract RangeManager is Ownable, ReentrancyGuard {
         uint256 amount1,
         address indexed initiator
     );
-    
+
+    event TokenRescued(address indexed token, address indexed to, uint256 amount);
+
+    /**
+     * @notice Recover ERC-20 tokens accidentally sent to this contract.
+     * @dev Owner-only. Pool tokens (token0/token1) are excluded to avoid interfering
+     *      with rebalance flows; use the Vault path for those.
+     */
+    function rescueToken(address tokenAddr, address to, uint256 amount) external onlyOwner {
+        require(to != address(0), "E40");
+        require(tokenAddr != token0 && tokenAddr != token1, "E41");
+        IERC20(tokenAddr).safeTransfer(to, amount);
+        emit TokenRescued(tokenAddr, to, amount);
+    }
+
     /**
      * @notice Burn une position NFT apres avoir retire toute la liquidite
      * @dev Appelee par le Vault ou les adresses autorisees (pour multi-swap)
@@ -1039,17 +1053,20 @@ contract RangeManager is Ownable, ReentrancyGuard {
         return _needsRebalance;
     }
 
-    /// @notice Atomic rebalance: burn → swap → mint → pay keeper bounty
-    /// @param swapAmountIn Amount to swap (must be ≤ initMultiSwapTvl in USD)
-    /// @param minAmountOut Minimum swap output (slippage protection)
-    /// @param tokenIn Source token for swap
-    /// @param tokenOut Destination token for swap
+    /// @notice Atomic rebalance: burn → N swaps → mint → pay keeper bounty. Permissionless.
+    /// @dev Each swap chunk must be ≤ initMultiSwapTvl in USD. Pass empty arrays if no swap needed.
+    /// @param swapAmountsIn Amounts to swap per chunk (must match minAmountsOut length)
+    /// @param minAmountsOut Minimum swap outputs per chunk (slippage protection)
+    /// @param tokenIn Source token for all swaps
+    /// @param tokenOut Destination token for all swaps
     function rebalance(
-        uint256 swapAmountIn,
-        uint256 minAmountOut,
+        uint256[] calldata swapAmountsIn,
+        uint256[] calldata minAmountsOut,
         address tokenIn,
         address tokenOut
     ) external nonReentrant {
+        require(swapAmountsIn.length == minAmountsOut.length, "len");
+
         // Verify rebalance is needed
         (bool hasPosition, uint256 tokenId, bool _needsRebalance,,) = RangeOperations.getBotInstructions(
             positionCount,
@@ -1064,16 +1081,23 @@ contract RangeManager is Ownable, ReentrancyGuard {
         );
         require(_needsRebalance, "No rebalance needed");
 
-        // Check swap amount vs initMultiSwapTvl
-        if (initMultiSwapTvl > 0) {
-            // Estimate USD value using price cache
-            uint256 swapValueUSD;
-            if (tokenIn == token0) {
-                swapValueUSD = (swapAmountIn * priceCache.price0) / (10 ** config.token0Decimals);
-            } else {
-                swapValueUSD = (swapAmountIn * priceCache.price1) / (10 ** config.token1Decimals);
+        uint256 n = swapAmountsIn.length;
+        if (n > 0) {
+            require(
+                (tokenIn == token0 && tokenOut == token1) ||
+                (tokenIn == token1 && tokenOut == token0),
+                "E43"
+            );
+
+            // Per-chunk size check vs initMultiSwapTvl (USD)
+            if (initMultiSwapTvl > 0) {
+                uint256 price = tokenIn == token0 ? priceCache.price0 : priceCache.price1;
+                uint256 dec = tokenIn == token0 ? config.token0Decimals : config.token1Decimals;
+                uint256 cap = initMultiSwapTvl * 1e8;
+                for (uint256 i; i < n; ++i) {
+                    require((swapAmountsIn[i] * price) / (10 ** dec) <= cap, "chunk>cap");
+                }
             }
-            require(swapValueUSD <= initMultiSwapTvl * 1e8, "Use multi-step");
         }
 
         // 1. Lock vault
@@ -1084,27 +1108,21 @@ contract RangeManager is Ownable, ReentrancyGuard {
             this.burnPosition(tokenId);
         }
 
-        // 3. Swap if needed
-        if (swapAmountIn > 0) {
-            require(
-                (tokenIn == token0 && tokenOut == token1) ||
-                (tokenIn == token1 && tokenOut == token0),
-                "E43"
-            );
-            require(IERC20(tokenIn).balanceOf(address(this)) >= swapAmountIn, "E46");
-
-            ISwapRouter.ExactInputSingleParams memory params = ISwapRouter.ExactInputSingleParams({
+        // 3. Execute swaps (if any)
+        for (uint256 i; i < n; ++i) {
+            uint256 amt = swapAmountsIn[i];
+            if (amt == 0) continue;
+            require(IERC20(tokenIn).balanceOf(address(this)) >= amt, "E46");
+            swapRouter.exactInputSingle(ISwapRouter.ExactInputSingleParams({
                 tokenIn: tokenIn,
                 tokenOut: tokenOut,
                 fee: config.fee,
                 recipient: address(this),
                 deadline: block.timestamp,
-                amountIn: swapAmountIn,
-                amountOutMinimum: minAmountOut,
+                amountIn: amt,
+                amountOutMinimum: minAmountsOut[i],
                 sqrtPriceLimitX96: 0
-            });
-
-            swapRouter.exactInputSingle(params);
+            }));
         }
 
         // 4. Mint new position

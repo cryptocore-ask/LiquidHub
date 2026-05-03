@@ -4,17 +4,11 @@ Keeper bot for the Liquid Hub Delta Neutral (DN) pool **UNI-ARB-WETH-USDC-DN**. 
 
 ## Overview
 
-The DN keeper bot performs the same rebalancing cycle as the standard pool (burn out-of-range position, swap tokens, mint new position) but adds an AAVE V3 hedge health check between the burn and swap/mint steps:
+The DN keeper bot performs the same rebalancing cycle as the standard pool. The keeper submits a single atomic transaction to `rebalance()` on the RangeManager, which performs lock → burn → swap(s) → mint → unlock → bounty internally. Swaps are automatically split into chunks ≤ `initMultiSwapTvl` (read on-chain).
 
-1. **Lock vault** -- `startRebalance()`
-2. **Burn position** -- Remove liquidity from Uniswap V3
-3. **Check AAVE hedge** -- Read health factor, log status (EMERGENCY / DELEVERAGE / WARNING / OK)
-4. **Calculate optimal swap** -- Determine token ratio for new range
-5. **Execute swap(s)** -- Multi-swap chunking for large amounts
-6. **Mint new position** -- Deploy liquidity in new range
-7. **Unlock vault** -- `endRebalance()`
+At each polling cycle the bot also displays the current AAVE V3 hedge health factor alongside the standard position data.
 
-At each polling cycle the bot also displays the current AAVE health factor alongside the standard position data.
+The `rebalance()` function is **fully permissionless** — any address can call it when `getBotInstructions()` indicates a rebalance is needed. No whitelisting or keeper role required.
 
 ## Setup
 

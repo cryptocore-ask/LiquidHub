@@ -9,6 +9,7 @@ contract DeployTradingBotModule is Script {
         address safeAddress = vm.envAddress("SAFE_ADDRESS");
         address botAddress = vm.envAddress("BOT_ADDRESS");
         address tradingVault = vm.envAddress("TRADING_VAULT_ADDRESS");
+        address treasury = vm.envAddress("TREASURY_ADDRESS");
         uint256 dailyLimit = 50; // 50 transactions par jour par défaut
 
         uint256 deployerKey = vm.envUint("DEPLOYER_PRIVATE_KEY");
@@ -19,6 +20,7 @@ contract DeployTradingBotModule is Script {
             safeAddress,
             botAddress,
             tradingVault,
+            treasury,
             dailyLimit
         );
 

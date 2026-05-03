@@ -30,7 +30,7 @@ contract DeployAaveHedge is Script {
         uint256 minDepositUSD = vm.envUint("MIN_DEPOSIT_USD");
 
         // AAVE V3 hedge reserve ratio (6250 = 62.5% for 75/25 strategy)
-        uint16 hedgeReserveRatio = uint16(vm.envUint("AAVE_RESERVE_RATIO_BPS"));
+        // hedgeReserveRatio supprimé — H_opt: bot gère la répartition AAVE/LP dynamiquement
 
         // AAVE V3 Pool on Arbitrum
         address aavePool = vm.envAddress("AAVE_POOL_ADDRESS");
@@ -61,7 +61,7 @@ contract DeployAaveHedge is Script {
         console.log("Safe:", safeAddress);
         console.log("Bot:", botAddress);
         console.log("AAVE Pool:", aavePool);
-        console.log("Hedge Reserve Ratio (bps):", hedgeReserveRatio);
+        console.log("Hedge: H_opt mode (bot-managed AAVE allocation)");
         console.log("SwapRouter:", swapRouterAddress);
         console.log("Swap Pool Fee:", swapPoolFee);
         console.log("========================================\n");
@@ -69,7 +69,7 @@ contract DeployAaveHedge is Script {
         vm.startBroadcast(deployerPrivateKey);
 
         // ===== 1. DEPLOY MULTIUSERVAULT =====
-        console.log("1. Deploying MultiUserVault with 75/25 hedge reserve...");
+        console.log("1. Deploying MultiUserVault (H_opt: bot manages AAVE allocation)...");
 
         MultiUserVault vault = new MultiUserVault(
             address(1), // Placeholder for RangeManager
@@ -77,8 +77,7 @@ contract DeployAaveHedge is Script {
             token1,
             treasuryAddress,
             commissionRate,
-            minDepositUSD,
-            hedgeReserveRatio // DN: 6250 = 62.5% reserved for AAVE collateral
+            minDepositUSD
         );
 
         console.log("   MultiUserVault deployed at:", address(vault));
@@ -136,6 +135,7 @@ contract DeployAaveHedge is Script {
             address(rangeManager),
             address(vault),
             address(hedgeManager),
+            treasuryAddress,
             dailyLimit
         );
 

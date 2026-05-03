@@ -9,11 +9,14 @@ interface IGmxExchangeRouter {
         DecreasePositionSwapType decreasePositionSwapType;
         bool isLong;
         bool shouldUnwrapNativeToken;
+        bool autoCancel;
         bytes32 referralCode;
+        bytes32[] dataList;
     }
 
     struct CreateOrderParamsAddresses {
         address receiver;
+        address cancellationReceiver;
         address callbackContract;
         address uiFeeReceiver;
         address market;
@@ -29,6 +32,7 @@ interface IGmxExchangeRouter {
         uint256 executionFee;
         uint256 callbackGasLimit;
         uint256 minOutputAmount;
+        uint256 validFromTime;
     }
 
     enum OrderType {

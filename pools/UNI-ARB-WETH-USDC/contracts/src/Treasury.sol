@@ -299,6 +299,30 @@ contract Treasury is Ownable {
         emit AdminWithdrawDisabled(block.timestamp);
     }
 
+    /// @notice Recover ERC-20 tokens accidentally sent here (other than USDC).
+    /// @dev USDC must go through adminWithdraw() to respect the monthly cap.
+    ///      Disabled once admin withdrawals are irreversibly turned off.
+    function rescueToken(address tokenAddr, address to, uint256 amount) external onlyOwner {
+        require(adminWithdrawEnabled, "Admin withdraw disabled");
+        require(to != address(0), "Invalid recipient");
+        require(tokenAddr != address(usdc), "Use adminWithdraw for USDC");
+        IERC20(tokenAddr).safeTransfer(to, amount);
+        emit TokenRescued(tokenAddr, to, amount);
+    }
+
+    /// @notice Recover native ETH accidentally sent here.
+    /// @dev Disabled once admin withdrawals are irreversibly turned off.
+    function rescueETH(address payable to, uint256 amount) external onlyOwner {
+        require(adminWithdrawEnabled, "Admin withdraw disabled");
+        require(to != address(0), "Invalid recipient");
+        (bool ok, ) = to.call{value: amount}("");
+        require(ok, "ETH transfer failed");
+        emit ETHRescued(to, amount);
+    }
+
+    event TokenRescued(address indexed token, address indexed to, uint256 amount);
+    event ETHRescued(address indexed to, uint256 amount);
+
     // --- Keeper Bounty Functions ---
 
     /// @notice Pay bounty to keeper who executed a rebalance. Called by authorized RangeManager.

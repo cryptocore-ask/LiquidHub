@@ -58,13 +58,18 @@ The bot also applies additional off-chain checks:
 
 ## Keeper Functions
 
-Three public functions allow anyone to execute critical position management:
+Public functions allow community keepers to execute critical position management. SL/TP closures are **bot-gated** (the protocol bot authorizes each closure for a 1-minute window), while liquidation is fully permissionless.
 
-| Function | Trigger | Description |
-|----------|---------|-------------|
-| `executeStopLoss(key)` | Price reaches stop-loss | Closes position at SL |
-| `executeTakeProfit(key)` | Price reaches take-profit | Closes position at TP |
-| `liquidatePosition(key)` | Collateral below maintenance margin | Liquidates position |
+| Function | Trigger | Authorization | Description |
+|----------|---------|---------------|-------------|
+| `executeStopLoss(key)` | Price hits SL **and** bot authorized | Bot calls `authorizeClosure(key, 1)` — 2 min window | Closes position at SL |
+| `executeTakeProfit(key)` | Price hits TP **and** bot authorized | Bot calls `authorizeClosure(key, 2)` — 2 min window | Closes position at TP |
+| `liquidatePosition(key)` | Collateral below maintenance margin | Permissionless | Liquidates position |
+| `settleAll()` | Pending settlements | Permissionless | Settles pending commissions |
+
+**Why SL/TP closures are bot-gated**: the protocol bot runs off-chain logic (technical analysis + AI sentiment + macro) that cannot be verified on-chain. When the bot's full decision process agrees with the closure, it authorizes it — giving community keepers a 1-minute window to execute and earn the bounty. After the window, the bot closes itself as a fallback.
+
+See the [Keeper Guide](./TRADING-KEEPER-GUIDE.md) for the full closure authorization model and keeper setup.
 
 Keeper bounties (paid from Treasury) are **disabled by default** and can be enabled by the Safe owner.
 
