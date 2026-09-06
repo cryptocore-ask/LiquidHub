@@ -349,8 +349,7 @@ class Rebalancer {
 
   async _ensureProgressivePriceCache() {
     let cache = await this.rpcPool.executeWithRetry(
-      async (provider) => this.rangeManager.connect(provider).priceCache(),
-      'Progressive price cache', { tier: 'critical' }
+      async (provider) => this.rangeManager.connect(provider).priceCache()
     );
     const valid = (value) => Boolean(value.valid ?? value[5])
       && BigInt(value.price0 ?? value[0] ?? 0) > 0n && BigInt(value.price1 ?? value[1] ?? 0) > 0n;
@@ -582,7 +581,7 @@ class Rebalancer {
 
   _shouldRefreshForPlanError(error) {
     const text = this._errorText(error).toLowerCase();
-    return ['stale', 'cache', 'oracle', 'twap', 'price', 'minout', 'too little received', 'partialfill', 'partial fill', 'cycle budget', 'reverse budget', 'use atomic', 'swapchunkabovecap', 'e38', 'e72', 'e73', 'e90', 'e91', 'e96', 'e93', 'e94']
+    return ['stale', 'cache', 'oracle', 'twap', 'price', 'minout', 'too little received', 'partialfill', 'partial fill', 'invalid chunk', 'cycle budget', 'reverse budget', 'use atomic', 'swapchunkabovecap', 'e38', 'e72', 'e73', 'e90', 'e91', 'e96', 'e93', 'e94']
       .some((marker) => text.includes(marker));
   }
 

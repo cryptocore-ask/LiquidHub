@@ -12,6 +12,144 @@ const { Rebalancer, calculateChunkPlan, divideIntoChunks } = require('../src/reb
 const { PersistentActionAlerts } = require('../src/utils/action-alerts');
 const { RPCPool } = require('../src/utils/rpc');
 
+// Keep the production RPC retry and progressive orchestration together: replacing
+// executeWithRetry with a one-argument stub used to hide an incompatible call.
+function progressiveFixture(overrides = {}) {
+  const state = {
+    status: 2, locked: true, planEpoch: 1n, cacheValid: true,
+    amount: 2511639308n, reads: 0, plans: 0, refreshes: 0, failures: 0,
+    refreshKeepsInvalid: false, persistentChunkError: false, ...overrides,
+  };
+  const sent = [];
+  const provider = {};
+  const rpc = Object.assign(Object.create(RPCPool.prototype), {
+    providers: [{ provider, chainVerified: true }],
+    getProvider: () => provider,
+  });
+  const connectable = (value) => Object.assign(value, { connect() { return this; } });
+  const cache = () => ({ valid: state.cacheValid, price0: 200000000000n, price1: 100000000n });
+  const r = Object.create(Rebalancer.prototype);
+  r.rpcPool = rpc;
+  r.wallet = { address: '0x0000000000000000000000000000000000000011' };
+  r.rangeManager = connectable({
+    priceCache: async () => { state.reads++; return cache(); },
+    getOwnerPositions: async () => state.locked ? [] : [1n],
+    config: async () => ({ token0Decimals: 18, token1Decimals: 6, maxSlippageBps: 100 }),
+    initMultiSwapTvl: async () => 10000n,
+  });
+  r.vault = connectable({ isRebalancing: async () => state.locked });
+  r.strategyEngine = connectable({
+    previewDecision: async () => ({ epoch: 1n, dataFresh: true, reason: 1, decisionHash: 'canonical-hash' }),
+    checkpointDue: async () => false,
+  });
+  r.secureBotModule = connectable({
+    progressiveRebalanceStatus: async () => state.status,
+    progressivePlanEpoch: async () => state.planEpoch,
+    getProgressiveSwapParams: async () => {
+      state.plans++;
+      return { swapNeeded: true, zeroForOne: false, amountIn: state.amount };
+    },
+    progressiveSwapBudgetUsdE8: async () => 90000n * 100000000n,
+    progressiveCycleBudgetUsdE8: async () => 90000n * 100000000n,
+    progressiveReverseBudgetUsdE8: async () => 90000n * 100000000n,
+    progressiveInitialZeroForOne: async () => false,
+    refreshProgressiveRebalance: { staticCall: async (hash) => assert.equal(hash, 'canonical-hash') },
+  });
+  // Only external chain effects are simulated; cache checks, plan reads, caps,
+  // minOut calculation, error classification and retry limits are production code.
+  r._refreshPriceCacheForAction = async () => {
+    state.refreshes++;
+    state.cacheValid = !state.refreshKeepsInvalid;
+    state.amount = 1948531563n;
+    return cache();
+  };
+  r._sendProgressiveTransaction = async (method, args) => {
+    sent.push({ method, args });
+    if (method === 'beginProgressiveRebalance' || method === 'refreshProgressiveRebalance') {
+      assert.deepEqual(args, ['canonical-hash']);
+      state.status = 2;
+      state.locked = true;
+      state.planEpoch = 1n;
+    } else {
+      assert.equal(method, 'finalizeProgressiveRebalance');
+      if (state.failures > 0 || state.persistentChunkError) {
+        state.failures--;
+        throw new Error('execution reverted: "Invalid chunk"');
+      }
+      state.status = 0;
+      state.locked = false;
+    }
+    return { hash: '0x' + sent.length };
+  };
+  return { r, state, sent };
+}
+
+test('progressive cache uses the real keeper RPC retry with a healthy provider', async () => {
+  const { r, state } = progressiveFixture();
+  assert.equal(await r._ensureProgressivePriceCache(), false);
+  assert.equal(state.reads, 1, 'the provider callback must actually execute');
+  assert.equal(state.refreshes, 0, 'a healthy cache does not spend gas');
+});
+
+test('progressive cache refreshes once and refuses a persistently invalid oracle', async () => {
+  const recovered = progressiveFixture({ cacheValid: false });
+  assert.equal(await recovered.r._ensureProgressivePriceCache(), true);
+  assert.equal(await recovered.r._ensureProgressivePriceCache(), false);
+  assert.equal(recovered.state.reads, 2);
+  assert.equal(recovered.state.refreshes, 1);
+  const failed = progressiveFixture({ cacheValid: false, refreshKeepsInvalid: true });
+  await assert.rejects(failed.r._runProgressiveRebalance(), /priceCache invalid after/);
+  assert.equal(failed.state.refreshes, 1);
+  assert.equal(failed.state.plans, 0);
+  assert.deepEqual(failed.sent, []);
+});
+
+for (const scenario of [
+  { name: 'start', status: 0, locked: false, planEpoch: 1n, first: 'beginProgressiveRebalance' },
+  { name: 'resume', status: 2, locked: true, planEpoch: 1n, first: 'finalizeProgressiveRebalance' },
+  { name: 'adopt after module rotation', status: 0, locked: true, planEpoch: 0n, first: 'refreshProgressiveRebalance' },
+]) {
+  test('real keeper RPC permits progressive ' + scenario.name + ' through completion', async () => {
+    const { r, state, sent } = progressiveFixture(scenario);
+    const result = scenario.locked
+      ? await r.resumeProgressiveRebalanceIfActive()
+      : await r._runProgressiveRebalance('canonical-hash');
+    assert.equal(result.success, true);
+    assert.equal(state.locked, false);
+    assert.ok(state.reads > 0);
+    assert.equal(state.refreshes, 0);
+    assert.equal(sent[0].method, scenario.first);
+    assert.equal(sent.at(-1).method, 'finalizeProgressiveRebalance');
+  });
+}
+
+test('Invalid chunk refreshes a still-valid cache and recomputes the final amount and minOut', async () => {
+  const { r, state, sent } = progressiveFixture({ failures: 1 });
+  const result = await r.resumeProgressiveRebalanceIfActive();
+  assert.equal(result.success, true);
+  assert.equal(state.refreshes, 1);
+  assert.equal(state.plans, 2);
+  assert.equal(state.locked, false);
+  assert.deepEqual(sent.map((tx) => tx.method), ['finalizeProgressiveRebalance', 'finalizeProgressiveRebalance']);
+  assert.deepEqual(sent.map((tx) => tx.args), [
+    [2511639308n, 1243261457460000000n],
+    [1948531563n, 964523123685000000n],
+  ]);
+  assert.deepEqual(result.txHashes, ['0x2'], 'a reverted attempt is not reported as mined');
+});
+
+test('Invalid chunk recovery is bounded to two refreshes and leaves the cycle resumable', async () => {
+  const { r, state, sent } = progressiveFixture({ persistentChunkError: true });
+  await assert.rejects(r.resumeProgressiveRebalanceIfActive(), /Invalid chunk/);
+  assert.equal(state.refreshes, 2);
+  assert.equal(state.plans, 3);
+  assert.equal(sent.length, 3);
+  assert.equal(state.status, 2);
+  assert.equal(state.locked, true);
+  assert.equal(r._shouldRefreshForPlanError(new Error('unauthorized')), false);
+});
+
+
 test('compound simulates a useful reinvestment before sending one parameterless operation', async () => {
   const r = Object.create(Rebalancer.prototype);
   const sent = [];
