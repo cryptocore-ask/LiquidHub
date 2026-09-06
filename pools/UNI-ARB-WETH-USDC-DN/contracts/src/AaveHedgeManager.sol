@@ -292,7 +292,7 @@ contract AaveHedgeManager is ReentrancyGuard {
             uint256 shortfall = debtToRepay - availableWeth;
             _flashLoanActive = true;
             bytes memory params =
-                abi.encode(debtToRepay, proportionBps, isFullWithdraw, recipient, idleWethBefore - idleWethShare);
+                abi.encode(debtToRepay, proportionBps, isFullWithdraw, recipient, idleWethBefore - idleWethShare, 0);
             pool.flashLoanSimple(address(this), address(weth), shortfall, params, 0);
             _flashLoanActive = false;
         }
@@ -334,8 +334,14 @@ contract AaveHedgeManager is ReentrancyGuard {
         if (!_flashLoanActive) revert HedgeCheck(19);
         if (asset != address(weth)) revert HedgeCheck(20);
 
-        (uint256 debtToRepay, uint256 proportionBps, bool isFullWithdraw, address recipient, uint256 protectedIdleWeth)
-        = abi.decode(params, (uint256, uint256, bool, address, uint256));
+        (
+            uint256 debtToRepay,
+            uint256 proportionBps,
+            bool isFullWithdraw,
+            address recipient,
+            uint256 protectedIdleWeth,
+            uint256 repaymentHfTargetBps
+        ) = abi.decode(params, (uint256, uint256, bool, address, uint256, uint256));
 
         uint256 usdcBefore = usdc.balanceOf(address(this));
 
@@ -346,10 +352,11 @@ contract AaveHedgeManager is ReentrancyGuard {
             pool.repay(address(weth), debtToRepay, 2, address(this));
         }
 
-        // recipient=0 is the permissionless HF-repair mode. Debt is repaid first, then only the collateral
-        // made safely withdrawable by that repay funds the oracle-bounded flash repayment.
+        // recipient=0 repays debt without a user withdrawal. The initiating path supplies its HF floor:
+        // urgent repair restores the operating buffer; ordinary hedge settlement preserves the safety floor
+        // already used by the engine projection. Debt is repaid before withdrawing collateral.
         if (recipient == address(0)) {
-            _completeHfRepair(amount + premium);
+            _completeFlashRepayment(amount + premium, repaymentHfTargetBps);
             return true;
         }
 
@@ -633,7 +640,7 @@ contract AaveHedgeManager is ReentrancyGuard {
         if (directRepair > 0) _doRepayDebt(directRepair);
         if (flashRepair > 0) {
             _flashLoanActive = true;
-            bytes memory params = abi.encode(flashRepair, 0, false, address(0), 0);
+            bytes memory params = abi.encode(flashRepair, 0, false, address(0), 0, operationalHfTargetBps());
             if (directRepair > 0) {
                 // Preserve a safe direct repayment if the residual flash leg is temporarily unavailable.
                 try pool.flashLoanSimple(address(this), address(weth), flashRepair, params, 0) {}
@@ -725,7 +732,9 @@ contract AaveHedgeManager is ReentrancyGuard {
         } else {
             // Repay d'abord grace au flash loan, puis seulement retirer le collateral rendu disponible.
             _flashLoanActive = true;
-            pool.flashLoanSimple(address(this), address(weth), diff, abi.encode(diff, 0, false, address(0), 0), 0);
+            pool.flashLoanSimple(
+                address(this), address(weth), diff, abi.encode(diff, 0, false, address(0), 0, reserveHfTargetBps), 0
+            );
             _flashLoanActive = false;
         }
 
@@ -793,13 +802,13 @@ contract AaveHedgeManager is ReentrancyGuard {
         );
     }
 
-    /// @dev Finishes a permissionless HF repair after the flash-loaned token0 has repaid debt.
-    ///      Only collateral made safely withdrawable by that repay may fund the oracle-bounded swap.
-    function _completeHfRepair(uint256 flashOwed) private {
+    /// @dev Funds an exact flash repayment after debt reduction, preserving the initiating path's HF floor.
+    ///      The operating buffer remains the urgent repair target and the reserve-rebuilding target.
+    function _completeFlashRepayment(uint256 flashOwed, uint256 targetHfBps) private {
         (uint256 amountInMaximum, uint160 sqrtPriceLimitX96) = _oracleMaxUsdcForWeth(flashOwed);
         uint256 budget = usdc.balanceOf(address(this));
         (uint256 capped, uint256 toWithdraw) = DnDepositLib.aaveHfSafeSwapBudget(
-            budget, amountInMaximum, address(pool), address(aTokenUsdc), liqThresholdBps, operationalHfTargetBps()
+            budget, amountInMaximum, address(pool), address(aTokenUsdc), liqThresholdBps, targetHfBps
         );
         if (toWithdraw > 0) pool.withdraw(address(usdc), toWithdraw, address(this));
         if (capped < amountInMaximum || usdc.balanceOf(address(this)) < amountInMaximum) revert HedgeCheck(58);
@@ -984,7 +993,7 @@ contract AaveHedgeManager is ReentrancyGuard {
                     address(this),
                     address(weth),
                     totalDebt - wethBalance,
-                    abi.encode(totalDebt, SHARE_SCALE, true, recipient, 0),
+                    abi.encode(totalDebt, SHARE_SCALE, true, recipient, 0, 0),
                     0
                 );
                 _flashLoanActive = false;

@@ -126,9 +126,8 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
     mapping(address => bool) public hasPendingDeposit;
 
     PendingDeposit[] public pendingDeposits;
-    // SÉCURITÉ (audit V1 — DoS gas A) : pointeur de tête de file. Traiter un dépôt avance _pendingHead
-    // (O(1)) au lieu de décaler tout le tableau (O(n) → O(n²) pour vider la file). La file est "vide"
-    // quand _pendingHead >= pendingDeposits.length ; on compacte (delete + reset) une fois vidée.
+    // Moving-head queue: each removal clears its own record. Emptying the queue only resets
+    // its length; no user or keeper ever clears the history of previously removed requests.
     uint256 private _pendingHead;
     mapping(address => uint256) private _pendingIndexPlusOne;
     uint256 private _pendingTotal0;
@@ -149,6 +148,7 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
         uint256 head = _pendingHead;
         uint256 last = pendingDeposits.length - 1;
         if (index == head) {
+            delete pendingDeposits[index];
             _pendingHead = head + 1;
         } else {
             if (index != last) {
@@ -160,7 +160,11 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
         }
 
         if (_pendingHead >= pendingDeposits.length) {
-            delete pendingDeposits;
+            // Every former slot was cleared by the head branch or pop(). Reset only the length:
+            // Solidity's `delete pendingDeposits` would still traverse all historical indices.
+            assembly ("memory-safe") {
+                sstore(pendingDeposits.slot, 0)
+            }
             _pendingHead = 0;
         }
     }

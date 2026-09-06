@@ -842,11 +842,11 @@ library DnDepositLib {
         uint256 diff = poolPrice > oraclePrice ? poolPrice - oraclePrice : oraclePrice - poolPrice;
         if ((diff * 10000) / oraclePrice > maxHedgeDeviationBps) revert LpPriceDeviation();
 
-        (bool twapEnabled,,, uint16 twapBps,,) = IRmDep(rangeManager).protectionConfig();
+        (bool twapEnabled,, uint16 maxTwapDeviationTicks,,,) = IRmDep(rangeManager).protectionConfig();
         if (twapEnabled) {
             int24 twapTick = RangeOperations.trustedTwapTick(lpPool);
             int24 tickDiff = currentTick > twapTick ? currentTick - twapTick : twapTick - currentTick;
-            if (uint24(tickDiff) > uint24(twapBps)) revert LpTwapDeviation();
+            if (uint24(tickDiff) > uint24(maxTwapDeviationTicks)) revert LpTwapDeviation();
         }
     }
 
