@@ -672,7 +672,7 @@ contract AaveHedgeManager is ReentrancyGuard {
         if (tokenId == 0) revert HedgeCheck(42);
 
         (uint256 token0InLP, int24 tickLower, int24 tickUpper) =
-            DnDepositLib.aaveLpToken0AndTicks(tokenId, lpPositionManager, lpPool);
+            DnDepositLib.aaveLpToken0AndTicks(tokenId, lpPositionManager, lpPool, !enforceThresholds);
         if (tickUpper <= tickLower) revert HedgeCheck(61);
 
         // 1b. audit V1 (V3-R4 Point 2) : garde anti-manipulation du prix LP. token0InLP derive du slot0 ; si le

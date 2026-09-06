@@ -784,17 +784,26 @@ library DnDepositLib {
 
     /// @notice Composition token0 du NFT LP + ticks, utilisée par AaveHedgeManager.adjustHedge().
     /// @dev Déport bytecode DN-only : évite une troisième library et laisse le settlement critique dans le manager.
-    function aaveLpToken0AndTicks(uint256 tokenId, INonfungiblePositionManager lpPositionManager, IUniswapV3Pool lpPool)
-        external
-        view
-        returns (uint256 token0InLP, int24 tickLower, int24 tickUpper)
-    {
+    function aaveLpToken0AndTicks(
+        uint256 tokenId,
+        INonfungiblePositionManager lpPositionManager,
+        IUniswapV3Pool lpPool,
+        bool newlyMinted
+    ) external view returns (uint256 token0InLP, int24 tickLower, int24 tickUpper) {
         uint128 liquidity;
         (,,,,, tickLower, tickUpper, liquidity,,,,) = lpPositionManager.positions(tokenId);
         if (liquidity == 0) return (0, tickLower, tickUpper);
 
-        int24 currentTick = RangeOperations.trustedTwapTick(lpPool);
-        uint160 sqrtPriceX96 = RangeOperations.sqrtRatioAtTickExt(currentTick);
+        int24 currentTick;
+        uint160 sqrtPriceX96;
+        if (newlyMinted) {
+            // A newly allocated NFT must be hedged against its actual composition.
+            // The caller still enforces the oracle AND TWAP deviation guards.
+            (sqrtPriceX96, currentTick,,,,,) = lpPool.slot0();
+        } else {
+            currentTick = RangeOperations.trustedTwapTick(lpPool);
+            sqrtPriceX96 = RangeOperations.sqrtRatioAtTickExt(currentTick);
+        }
         uint160 sqrtRatioA = RangeOperations.sqrtRatioAtTickExt(tickLower);
         uint160 sqrtRatioB = RangeOperations.sqrtRatioAtTickExt(tickUpper);
 

@@ -472,16 +472,32 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
     ///      Déclenchable par n'importe qui après `dnDepositRefundDelay`. Avance la tête comme un traitement.
     function refundStaleHeadDeposit() external nonReentrant {
         if (_pendingCount() == 0) revert E24();
-        PendingDeposit memory pd = pendingDeposits[_pendingHead];
+        _refundStaleDeposit(_pendingHead);
+    }
+
+    /// @notice Refund any matured request, including one displaced by a Safe recovery.
+    /// @dev Permissionless, O(1), and paid exclusively to the recorded depositor.
+    function refundStaleDeposit(address depositor) external nonReentrant {
+        uint256 indexPlusOne = _pendingIndexPlusOne[depositor];
+        if (indexPlusOne == 0) revert E24();
+        _refundStaleDeposit(indexPlusOne - 1);
+    }
+
+    function _refundStaleDeposit(uint256 index) private {
+        PendingDeposit memory pd = pendingDeposits[index];
         if (block.timestamp < pd.timestamp + dnDepositRefundDelay) revert E_NOT_REFUNDABLE();
 
-        _removePending(_pendingHead, pd);
+        _removePending(index, pd);
 
         // Rembourser le déposant (fonds encore détenus par le vault tant que non traités). Destinataire FIGÉ = pd.user.
-        if (pd.amount0 > 0) token0.safeTransfer(pd.user, pd.amount0);
-        if (pd.amount1 > 0) token1.safeTransfer(pd.user, pd.amount1);
+        _transferPair(pd.user, pd.amount0, pd.amount1);
 
         emit DepositRefunded(pd.user, pd.amount0, pd.amount1);
+    }
+
+    function _transferPair(address recipient, uint256 amount0, uint256 amount1) private {
+        if (amount0 > 0) token0.safeTransfer(recipient, amount0);
+        if (amount1 > 0) token1.safeTransfer(recipient, amount1);
     }
 
     // ===== PROCESS DEPOSITS ET WITHDRAW =====
@@ -869,8 +885,7 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
             minWithdrawValueUsd != 0
                 && !IBotNav(botModule).isWithdrawValueSufficient(toSend0, toSend1, minWithdrawValueUsd)
         ) revert WithdrawalValueTooLow();
-        if (toSend0 > 0) token0.safeTransfer(msg.sender, toSend0);
-        if (toSend1 > 0) token1.safeTransfer(msg.sender, toSend1);
+        _transferPair(msg.sender, toSend0, toSend1);
 
         emit Withdraw(msg.sender, toSend0, toSend1, shareAmount);
     }
@@ -1488,8 +1503,7 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
         uint256 toSend0 = userAmount0 - wethForRepay;
         uint256 toSend1 = userAmount1;
         if (bal0 < toSend0 || bal1 < toSend1) revert E46();
-        if (toSend0 > 0) token0.safeTransfer(userAddress, toSend0);
-        if (toSend1 > 0) token1.safeTransfer(userAddress, toSend1);
+        _transferPair(userAddress, toSend0, toSend1);
 
         emit EmergencyUserRecovered(userAddress, toSend0, toSend1, userShares);
     }

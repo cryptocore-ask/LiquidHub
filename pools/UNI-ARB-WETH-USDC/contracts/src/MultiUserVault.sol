@@ -411,10 +411,22 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
     /// @dev Permissionless et destination figée au déposant : libère la queue sans pouvoir détourner de fonds.
     function refundStaleHeadDeposit() external nonReentrant {
         require(_pendingCount() > 0, "E24");
-        PendingDeposit memory pd = pendingDeposits[_pendingHead];
+        _refundStaleDeposit(_pendingHead);
+    }
+
+    /// @notice Refund any matured request, including one displaced by a Safe recovery.
+    /// @dev Permissionless, O(1), and paid exclusively to the recorded depositor.
+    function refundStaleDeposit(address depositor) external nonReentrant {
+        uint256 indexPlusOne = _pendingIndexPlusOne[depositor];
+        require(indexPlusOne != 0, "E24");
+        _refundStaleDeposit(indexPlusOne - 1);
+    }
+
+    function _refundStaleDeposit(uint256 index) private {
+        PendingDeposit memory pd = pendingDeposits[index];
         require(block.timestamp >= pd.timestamp + depositRefundDelay, "E_NOT_REFUNDABLE");
 
-        _removePending(_pendingHead, pd);
+        _removePending(index, pd);
 
         if (pd.amount0 > 0) token0.safeTransfer(pd.user, pd.amount0);
         if (pd.amount1 > 0) token1.safeTransfer(pd.user, pd.amount1);

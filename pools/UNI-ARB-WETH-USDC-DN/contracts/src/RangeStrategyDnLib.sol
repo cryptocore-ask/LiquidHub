@@ -9,6 +9,7 @@ import "./RangeOperations.sol";
 import "./interfaces/IRangeStrategyEngine.sol";
 
 interface IDnRangeManagerState {
+    function token1() external view returns (address);
     function refreshPriceCache() external;
     function priceCache()
         external
@@ -198,6 +199,8 @@ library RangeStrategyDnLib {
         uint256 healthFactorBps;
         uint256 availableBorrowsBase;
         uint256 idleStableBase;
+        uint256 idleRmValueBase;
+        uint256 countedIdleRmToken0;
         uint256 debtToken0;
         int256 effectiveShortToken0;
         uint128 price0;
@@ -340,10 +343,16 @@ library RangeStrategyDnLib {
         uint256 idleRm = IERC20(token0).balanceOf(rangeManager);
         uint256 countedIdle = (idleHm > dust ? idleHm - dust : 0) + (idleRm > dust ? idleRm - dust : 0);
         context.effectiveShortToken0 = int256(context.debtToken0) - int256(countedIdle);
+        context.countedIdleRmToken0 = _netOfDust(idleRm, dust);
         (, context.token0Decimals, context.token1Decimals,,,,,) = IDnRangeManagerState(rangeManager).config();
         (uint128 price0, uint128 price1,,,,) = IDnRangeManagerState(rangeManager).priceCache();
         context.price0 = price0;
         context.price1 = price1;
+        // The NFT may have been burned while Aave still holds collateral and debt.
+        // These assets belong to the RM; pending deposits remain reserved in the Vault.
+        context.idleRmValueBase = idleRm * uint256(price0) / (10 ** context.token0Decimals)
+            + IERC20(IDnRangeManagerState(rangeManager).token1()).balanceOf(rangeManager) * uint256(price1)
+                / (10 ** context.token1Decimals);
         context.hedgeTargetBps = hedge.hedgeTargetBps();
         context.adjustThresholdBps = hedge.adjustHedgeBps();
         context.liquidationThresholdBps = hedge.liqThresholdBps();
@@ -476,6 +485,7 @@ library RangeStrategyDnLib {
                 if (recovery.admissible) {
                     result.admissibleCount++;
                     result.bestRecovery = _betterRecovery(result.bestRecovery, recovery);
+                    if (!position.exists && recovery.scoreBps > result.best.scoreBps) result.best = recovery;
                 }
             }
         }
@@ -558,12 +568,13 @@ library RangeStrategyDnLib {
         int24 liveTick
     ) private pure returns (bool admissible, uint256 penaltyBps, uint256 hedgeDriftBps) {
         if (!context.configured) return (false, 0, 0);
-        if (!position.exists) return (true, 0, 0);
+        // Donations before the first deposit must not turn bootstrap into an Aave recovery.
+        if (!position.exists && context.collateralBase == 0 && context.debtBase == 0) return (true, 0, 0);
 
         uint256 targetShort = _candidateTargetShort(context, position, lower, upper, liveTick);
         if (targetShort == 0) return (false, 0, 0);
-        uint256 effectiveShort = context.effectiveShortToken0 < 0 ? 0 : uint256(context.effectiveShortToken0);
-        Projection memory projected = _projectHedgeState(context, risk, targetShort);
+        uint256 effectiveShort = _candidateEffectiveShort(context, position.exists);
+        Projection memory projected = _projectHedgeState(context, risk, targetShort, effectiveShort);
         if (!projected.admissible) return (false, 0, projected.hedgeDriftBps);
 
         uint256 turnoverPenalty = _min(_absDiff(targetShort, effectiveShort) * BPS / targetShort / 4, 2000);
@@ -580,7 +591,13 @@ library RangeStrategyDnLib {
         uint16 width,
         SearchConfig memory config
     ) private pure returns (int24 bestLower, int24 bestUpper, bool found) {
-        if (!position.exists || !context.configured) return (0, 0, false);
+        if (
+            !context.configured
+                || (
+                    !position.exists
+                        && (context.idleRmValueBase == 0 || (context.collateralBase == 0 && context.debtBase == 0))
+                )
+        ) return (0, 0, false);
         int256 spacing = int256(config.tickSpacing);
         int256 low = int256(config.liveTick) - int256(uint256(width)) + spacing;
         int256 high = int256(config.liveTick) + int256(uint256(width)) - spacing;
@@ -596,7 +613,7 @@ library RangeStrategyDnLib {
         if (low > high) return (0, 0, false);
         int256 minimumSearchCenter = low;
         int256 maximumSearchCenter = high;
-        uint256 effectiveShort = context.effectiveShortToken0 < 0 ? 0 : uint256(context.effectiveShortToken0);
+        uint256 effectiveShort = _candidateEffectiveShort(context, position.exists);
         uint256 bestDifference = type(uint256).max;
 
         for (uint256 iteration; iteration < 12 && low <= high; ++iteration) {
@@ -799,7 +816,7 @@ library RangeStrategyDnLib {
         uint256 exposureBase = exposureToken0 * uint256(context.price0) / token0Units;
         exposureBps = portfolioBase == 0 ? type(uint256).max : exposureBase * BPS / portfolioBase;
         if (target == 0) return (effectiveShort > 0 ? type(uint256).max : 0, exposureBps, false, direction);
-        Projection memory projected = _projectHedgeState(context, risk, target);
+        Projection memory projected = _projectHedgeState(context, risk, target, effectiveShort);
         return (projected.hedgeDriftBps, exposureBps, projected.admissible, direction);
     }
 
@@ -976,19 +993,37 @@ library RangeStrategyDnLib {
         int24 upper,
         int24 liveTick
     ) private pure returns (uint256) {
-        uint256 candidateToken0 = RangeOperations.strategyCandidateToken0ForCurrentValue(
-            position.lower, position.upper, lower, upper, liveTick, position.liquidity
-        );
+        uint256 candidateToken0;
+        if (position.exists) {
+            candidateToken0 = RangeOperations.strategyCandidateToken0ForCurrentValue(
+                position.lower, position.upper, lower, upper, liveTick, position.liquidity
+            );
+        } else {
+            (uint256 amount0, uint256 amount1) =
+                RangeOperations.strategyAmountsAtTick(lower, upper, liveTick, SAMPLE_LIQUIDITY);
+            uint256 value = amount0 * uint256(context.price0) / (10 ** context.token0Decimals)
+                + amount1 * uint256(context.price1) / (10 ** context.token1Decimals);
+            if (value == 0) return 0;
+            candidateToken0 = Math.mulDiv(amount0, context.idleRmValueBase, value);
+        }
         return candidateToken0 * context.hedgeTargetBps / BPS;
     }
 
-    function _projectHedgeState(Context memory context, RiskConfig memory risk, uint256 targetShort)
-        private
-        pure
-        returns (Projection memory projected)
-    {
+    function _candidateEffectiveShort(Context memory context, bool positionExists) private pure returns (uint256) {
+        // During recovery the released RM token0 is allocated to the new NFT, so it
+        // must not ALSO be subtracted from the short used to finance that NFT.
+        int256 short = context.effectiveShortToken0;
+        if (!positionExists) short += int256(context.countedIdleRmToken0);
+        return short < 0 ? 0 : uint256(short);
+    }
+
+    function _projectHedgeState(
+        Context memory context,
+        RiskConfig memory risk,
+        uint256 targetShort,
+        uint256 effectiveShort
+    ) private pure returns (Projection memory projected) {
         if (!context.configured || targetShort == 0) return projected;
-        uint256 effectiveShort = context.effectiveShortToken0 < 0 ? 0 : uint256(context.effectiveShortToken0);
         projected.hedgeDriftBps = _absDiff(targetShort, effectiveShort) * BPS / targetShort;
         uint256 units = 10 ** context.token0Decimals;
         uint256 targetBase = targetShort * uint256(context.price0) / units;
