@@ -347,7 +347,23 @@ class Rebalancer {
     }, label);
   }
 
+  async _ensureProgressivePriceCache() {
+    let cache = await this.rpcPool.executeWithRetry(
+      async (provider) => this.rangeManager.connect(provider).priceCache(),
+      'Progressive price cache', { tier: 'critical' }
+    );
+    const valid = (value) => Boolean(value.valid ?? value[5])
+      && BigInt(value.price0 ?? value[0] ?? 0) > 0n && BigInt(value.price1 ?? value[1] ?? 0) > 0n;
+    if (valid(cache)) return false;
+    // A failed oracle read can persist in storage after the feed recovers. Refresh before
+    // quoting or simulating the canonical target, including the DN pre-HF view.
+    cache = await this._refreshPriceCacheForAction('progressive plan recovery');
+    if (!valid(cache)) throw new Error('priceCache invalid after progressive recovery refresh');
+    return true;
+  }
+
   async _readProgressivePlan() {
+    await this._ensureProgressivePriceCache();
     return await this.rpcPool.executeWithRetry(async (provider) => {
       const module = this._requireProgressiveModule().connect(provider);
       const rm = this.rangeManager.connect(provider);
@@ -404,6 +420,7 @@ class Rebalancer {
     });
     let state = await readState();
     if (![0, 2].includes(state.status) || !state.locked || state.positions.length !== 0) return false;
+    if (await this._ensureProgressivePriceCache()) state = await readState();
     if (state.checkpointDue) {
       // The current engine must authorise the new target. Never invent ticks or widen a swap budget locally.
 

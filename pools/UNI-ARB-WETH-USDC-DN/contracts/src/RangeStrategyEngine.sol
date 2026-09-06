@@ -36,6 +36,10 @@ interface IRangeManagerStrategy {
         );
 }
 
+interface IStrategyDepositVault {
+    function getPendingDepositsCount() external view returns (uint256);
+}
+
 interface IStrategyCheckpointTreasury {
     function payStrategyCheckpointBounty(address keeper, uint64 epoch) external;
 }
@@ -154,6 +158,7 @@ contract RangeStrategyEngine is Ownable, ReentrancyGuard, IRangeStrategyEngine {
     uint16 public learningInfluenceBps;
     uint64 private _lastCheckpointEpoch;
     uint64 internal _outOfRangeSince;
+    address private immutable _strategyVault;
     uint64 private _hedgeRecoverySince;
     uint64 private _hedgeSignalSince;
     uint8 private _hedgeSignalDirection;
@@ -215,6 +220,7 @@ contract RangeStrategyEngine is Ownable, ReentrancyGuard, IRangeStrategyEngine {
             revert InvalidConfiguration();
         }
 
+        _strategyVault = vaultAddress;
         rangeManager = _rangeManager;
         pool = poolAddress;
         hedgeManager = _hedgeManager;
@@ -618,7 +624,8 @@ contract RangeStrategyEngine is Ownable, ReentrancyGuard, IRangeStrategyEngine {
         uint256 currentHedgeExposureBps = hedgeControl.exposureBps;
         bool directHedgeFeasible = hedgeControl.adjustmentFeasible;
         bool hedgeRecoveryPending = position.exists && position.inRange && !directHedgeFeasible
-            && currentHedgeDriftBps >= dn.criticalHedgeBps && currentHedgeExposureBps >= strategyConfig.dnMinHedgeDeltaBps;
+            && currentHedgeDriftBps >= dn.criticalHedgeBps
+            && (dn.depositPending || currentHedgeExposureBps >= strategyConfig.dnMinHedgeDeltaBps);
         if (hedgeRecoveryPending && _hedgeRecoverySince == 0) {
             _hedgeRecoverySince = uint64(block.timestamp);
         } else if (!hedgeRecoveryPending) {
@@ -730,6 +737,7 @@ contract RangeStrategyEngine is Ownable, ReentrancyGuard, IRangeStrategyEngine {
     function _dnContext() private view returns (RangeStrategyDnLib.Context memory dn) {
         (bool rateAvailable, uint256 rateRay) = RangeStrategyDnLib.aaveBorrowRateRay(hedgeManager);
         dn = RangeStrategyDnLib.loadContext(hedgeManager, rangeManager, _strategyToken0, rateAvailable, rateRay);
+        if (dn.configured) dn.depositPending = IStrategyDepositVault(_strategyVault).getPendingDepositsCount() > 0;
     }
 
     function _dnPosition(PositionState memory position)

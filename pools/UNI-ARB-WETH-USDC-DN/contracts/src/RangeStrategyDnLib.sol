@@ -192,6 +192,7 @@ library RangeStrategyDnLib {
 
     struct Context {
         bool configured;
+        bool depositPending;
         uint256 collateralBase;
         uint256 debtBase;
         uint256 healthFactorBps;
@@ -719,7 +720,9 @@ library RangeStrategyDnLib {
         uint8 direction;
         (control.driftBps, control.exposureBps, control.adjustmentFeasible, direction) =
             _hedgeOnlyStatus(context, position, risk, liveTick);
-        bool exposureLargeEnough = control.exposureBps >= minimumHedgeDeltaBps;
+        // Keep the calibrated economic filter for ordinary maintenance. A queued deposit
+        // cannot wait for a hedge that the admission guard requires but this filter forbids.
+        bool exposureLargeEnough = control.exposureBps >= minimumHedgeDeltaBps || context.depositPending;
         (control.signalSince, control.direction, control.normalConfirmed) = _nextHedgeSignal(
             previousSignalSince,
             previousDirection,
@@ -735,7 +738,7 @@ library RangeStrategyDnLib {
         bool cooldownElapsed = block.timestamp >= uint256(context.lastAdjustmentAt) + context.cooldownSeconds;
         bool normalEligible = control.adjustmentFeasible && exposureLargeEnough && control.normalConfirmed
             && control.driftBps >= context.adjustThresholdBps && cooldownElapsed
-            && _hedgeOnlyRangeStable(position, liveTick, risk.hedgeOnlyMinEdgeBps);
+            && (context.depositPending || _hedgeOnlyRangeStable(position, liveTick, risk.hedgeOnlyMinEdgeBps));
         control.eligible = control.critical || normalEligible;
     }
 
