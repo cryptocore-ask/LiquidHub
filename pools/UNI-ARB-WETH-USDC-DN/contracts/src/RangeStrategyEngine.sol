@@ -304,9 +304,8 @@ contract RangeStrategyEngine is Ownable, ReentrancyGuard, IRangeStrategyEngine {
         (uint128 price0, uint128 price1,, int24 liveTick,, bool valid) = rm.priceCache();
         if (!valid || price0 == 0 || price1 == 0) revert StrategyDataUnavailable();
 
-        (int24 tacticalTick, int24 strategicTick) = RangeStrategyDnLib.canonicalTwaps(
-            pool, epoch, cfg.epochSeconds, cfg.tacticalHorizonSeconds, cfg.strategicHorizonSeconds
-        );
+        (int24 tacticalTick, int24 strategicTick) =
+            _canonicalTwaps(pool, epoch, cfg.epochSeconds, cfg.tacticalHorizonSeconds, cfg.strategicHorizonSeconds);
         uint256 feeGrowth0 = IUniswapV3Pool(pool).feeGrowthGlobal0X128();
         uint256 feeGrowth1 = IUniswapV3Pool(pool).feeGrowthGlobal1X128();
         uint64 previousTimestamp = marketState.checkpointTimestamp;
@@ -620,6 +619,15 @@ contract RangeStrategyEngine is Ownable, ReentrancyGuard, IRangeStrategyEngine {
         RangeStrategyDnLib.HedgeControl memory hedgeControl = _hedgeControl(dn, position, liveTick);
         _hedgeSignalSince = hedgeControl.signalSince;
         _hedgeSignalDirection = hedgeControl.direction;
+        // Normalize idle token0 through the ordinary hedge lane before considering an LP burn/remint.
+        if (hedgeControl.eligible && hedgeControl.direction == 1 && dn.effectiveShortToken0 < int256(dn.debtToken0)) {
+            _hedgeRecoverySince = 0;
+            decision.action = Action.HEDGE_ONLY;
+            decision.reason = ReasonCode.HEDGE_DRIFT;
+            decision.targetTickLower = position.lower;
+            decision.targetTickUpper = position.upper;
+            return _finishDecision(decision, summary);
+        }
         uint256 currentHedgeDriftBps = hedgeControl.driftBps;
         uint256 currentHedgeExposureBps = hedgeControl.exposureBps;
         bool directHedgeFeasible = hedgeControl.adjustmentFeasible;
@@ -757,6 +765,28 @@ contract RangeStrategyEngine is Ownable, ReentrancyGuard, IRangeStrategyEngine {
         risk.minStressHfBps = strategyConfig.dnMinStressHfBps;
         risk.hedgeOnlyMinEdgeBps = strategyConfig.dnHedgeOnlyMinEdgeBps;
         risk.strategicHorizonSeconds = strategyConfig.strategicHorizonSeconds;
+    }
+
+    function _canonicalTwaps(
+        address poolAddress,
+        uint64 epoch,
+        uint32 epochSeconds,
+        uint32 tacticalHorizonSeconds,
+        uint32 strategicHorizonSeconds
+    ) private view returns (int24 tacticalTick, int24 strategicTick) {
+        uint32 endAgo = uint32(block.timestamp - uint256(epoch) * epochSeconds);
+        uint32[] memory secondsAgos = new uint32[](3);
+        secondsAgos[0] = endAgo + strategicHorizonSeconds;
+        secondsAgos[1] = endAgo + tacticalHorizonSeconds;
+        secondsAgos[2] = endAgo;
+        (int56[] memory cumulatives,) = IUniswapV3Pool(poolAddress).observe(secondsAgos);
+        strategicTick = _meanCanonicalTick(cumulatives[2] - cumulatives[0], strategicHorizonSeconds);
+        tacticalTick = _meanCanonicalTick(cumulatives[2] - cumulatives[1], tacticalHorizonSeconds);
+    }
+
+    function _meanCanonicalTick(int56 delta, uint32 seconds_) private pure returns (int24 tick) {
+        tick = int24(delta / int56(uint56(seconds_)));
+        if (delta < 0 && delta % int56(uint56(seconds_)) != 0) tick--;
     }
 
     function _hedgeControl(RangeStrategyDnLib.Context memory dn, PositionState memory position, int24 liveTick)

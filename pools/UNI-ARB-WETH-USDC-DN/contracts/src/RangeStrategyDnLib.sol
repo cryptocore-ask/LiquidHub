@@ -10,6 +10,8 @@ import "./interfaces/IRangeStrategyEngine.sol";
 
 interface IDnRangeManagerState {
     function token1() external view returns (address);
+    function initMultiSwapTvl() external view returns (uint256);
+    function sendTokenForHedge(address token, uint256 amount, address to) external;
     function refreshPriceCache() external;
     function priceCache()
         external
@@ -86,23 +88,9 @@ library RangeStrategyDnLib {
     uint160 private constant MAX_SQRT_PRICE_LIMIT_X96 = 1461446703485210103287273052203988822378723970341;
 
     error InvalidNegativeHedgeSwap();
+    error HedgeCheck(uint8 code);
 
-    function canonicalTwaps(
-        address pool,
-        uint64 epoch,
-        uint32 epochSeconds,
-        uint32 tacticalHorizonSeconds,
-        uint32 strategicHorizonSeconds
-    ) external view returns (int24 tacticalTick, int24 strategicTick) {
-        uint32 endAgo = uint32(block.timestamp - uint256(epoch) * epochSeconds);
-        uint32[] memory secondsAgos = new uint32[](3);
-        secondsAgos[0] = endAgo + strategicHorizonSeconds;
-        secondsAgos[1] = endAgo + tacticalHorizonSeconds;
-        secondsAgos[2] = endAgo;
-        (int56[] memory cumulatives,) = IUniswapV3Pool(pool).observe(secondsAgos);
-        strategicTick = _meanCanonicalTick(cumulatives[2] - cumulatives[0], strategicHorizonSeconds);
-        tacticalTick = _meanCanonicalTick(cumulatives[2] - cumulatives[1], tacticalHorizonSeconds);
-    }
+    event HedgeInventoryNormalized(uint256 amount0, uint256 amount1, bool complete);
 
     function aaveBorrowRateRay(address hedgeManager) external view returns (bool available, uint256 rateRay) {
         (bool poolOk, bytes memory poolData) = hedgeManager.staticcall(abi.encodeWithSignature("pool()"));
@@ -119,27 +107,48 @@ library RangeStrategyDnLib {
         available = rateRay > 0 && rateRay <= 10e27;
     }
 
-    /// @dev Called by delegatecall from AaveHedgeManager. It sells only the exact token0 excess held by that
-    ///      manager, with the same live oracle and sqrt-price bounds as an ordinary under-hedge adjustment.
-    function normalizeNegativeEffectiveShort() external returns (uint256 debt, int256 effectiveShort) {
+    /// @dev Delegatecall from the existing hedge path. Admission uses the PRE-swap drift.
+    ///      Consume free inventory before borrowing, preserve each dust floor and use the RM's
+    ///      existing per-swap USD ceiling. A capped correction may continue at a later checkpoint.
+    function prepareHedgeInventory(uint256 target, bool enforceThresholds)
+        external
+        returns (uint256 debt, int256 effectiveShort, bool inventoryRemaining, uint256 normalized0)
+    {
         IDnNegativeHedgeContext context = IDnNegativeHedgeContext(address(this));
         address token0 = context.weth();
         address rangeManager = context.rangeManager();
         uint256 dustFloor = context.donationDustToken0();
         uint256 idleHm;
         (debt, effectiveShort, idleHm) = _effectiveShort(context.variableDebtWeth(), token0, rangeManager, dustFloor);
-        if (effectiveShort >= 0) return (debt, effectiveShort);
-
-        uint256 excessToken0 = uint256(-effectiveShort);
-        if (idleHm < excessToken0) return (debt, effectiveShort);
-
+        if (target == 0) revert HedgeCheck(44);
+        uint256 difference = effectiveShort < int256(target)
+            ? uint256(int256(target) - effectiveShort)
+            : uint256(effectiveShort - int256(target));
+        if (enforceThresholds) {
+            IDnAaveStrategyState hedge = IDnAaveStrategyState(address(this));
+            uint256 drift = difference * BPS / target;
+            if (
+                block.timestamp < uint256(hedge.lastHedgeAdjustAt()) + hedge.hedgeAdjustCooldown()
+                    && drift < hedge.criticalHedgeBps()
+            ) revert HedgeCheck(41);
+            if (drift < hedge.adjustHedgeBps()) revert HedgeCheck(44);
+        }
+        if (effectiveShort >= int256(target)) return (debt, effectiveShort, false, 0);
+        uint256 idle = uint256(int256(debt) - effectiveShort);
+        if (idle == 0) return (debt, effectiveShort, false, 0);
         IDnRangeManagerState(rangeManager).refreshPriceCache();
         (uint128 price0, uint128 price1, uint160 sqrtP,,, bool valid) = IDnRangeManagerState(rangeManager).priceCache();
         if (!(valid && price0 > 0 && price1 > 0 && sqrtP > 0)) revert InvalidNegativeHedgeSwap();
 
         address token1 = context.usdc();
+        uint256 amount0 = _min(_min(difference, idle), _inventoryCap(rangeManager, price0, context.volatileDecimals()));
+        if (amount0 == 0) revert InvalidNegativeHedgeSwap();
+        inventoryRemaining = amount0 < _min(difference, idle);
+        if (amount0 > idleHm) {
+            IDnRangeManagerState(rangeManager).sendTokenForHedge(token0, amount0 - idleHm, address(this));
+        }
         uint256 theoretical = Math.mulDiv(
-            excessToken0,
+            amount0,
             uint256(price0) * (10 ** context.stableDecimals()),
             uint256(price1) * (10 ** context.volatileDecimals())
         );
@@ -159,21 +168,25 @@ library RangeStrategyDnLib {
                 fee: context.swapPoolFee(),
                 recipient: address(this),
                 deadline: block.timestamp,
-                amountIn: excessToken0,
+                amountIn: amount0,
                 amountOutMinimum: minOut,
                 sqrtPriceLimitX96: sqrtLimit
             })
         );
-        if (IERC20(token0).balanceOf(address(this)) != token0Before - excessToken0) {
+        if (IERC20(token0).balanceOf(address(this)) != token0Before - amount0) {
             revert InvalidNegativeHedgeSwap();
         }
-        if (amount1 > 0) IDnAaveSupply(context.pool()).supply(token1, amount1, address(this), 0);
+        // The stable reserve is shared portfolio equity; queued user deposits stay in the Vault.
+        IDnAaveSupply(context.pool()).supply(token1, IERC20(token1).balanceOf(address(this)), address(this), 0);
+        int256 beforeShort = effectiveShort;
         (debt, effectiveShort,) = _effectiveShort(context.variableDebtWeth(), token0, rangeManager, dustFloor);
+        if (effectiveShort != beforeShort + int256(amount0)) revert InvalidNegativeHedgeSwap();
+        normalized0 = amount0;
+        emit HedgeInventoryNormalized(amount0, amount1, !inventoryRemaining);
     }
 
-    function _meanCanonicalTick(int56 delta, uint32 seconds_) private pure returns (int24 tick) {
-        tick = int24(delta / int56(uint56(seconds_)));
-        if (delta < 0 && delta % int56(uint56(seconds_)) != 0) tick--;
+    function _inventoryCap(address rm, uint128 price0, uint8 decimals0) private view returns (uint256) {
+        return Math.mulDiv(IDnRangeManagerState(rm).initMultiSwapTvl() * 1e8, 10 ** decimals0, price0);
     }
 
     function _effectiveShort(address debtToken, address token0, address rangeManager, uint256 dustFloor)
@@ -201,6 +214,7 @@ library RangeStrategyDnLib {
         uint256 idleStableBase;
         uint256 idleRmValueBase;
         uint256 countedIdleRmToken0;
+        uint256 maxInventorySwapToken0;
         uint256 debtToken0;
         int256 effectiveShortToken0;
         uint128 price0;
@@ -348,6 +362,7 @@ library RangeStrategyDnLib {
         (uint128 price0, uint128 price1,,,,) = IDnRangeManagerState(rangeManager).priceCache();
         context.price0 = price0;
         context.price1 = price1;
+        if (price0 > 0) context.maxInventorySwapToken0 = _inventoryCap(rangeManager, price0, context.token0Decimals);
         // The NFT may have been burned while Aave still holds collateral and debt.
         // These assets belong to the RM; pending deposits remain reserved in the Vault.
         context.idleRmValueBase = idleRm * uint256(price0) / (10 ** context.token0Decimals)
@@ -795,29 +810,33 @@ library RangeStrategyDnLib {
         (uint256 token0InLp, uint256 token1InLp) =
             RangeOperations.strategyAmountsAtTick(position.lower, position.upper, liveTick, position.liquidity);
         uint256 target = token0InLp * context.hedgeTargetBps / BPS;
-        if (context.effectiveShortToken0 < 0) {
-            uint256 excessToken0 = uint256(-context.effectiveShortToken0);
-            uint256 negativeToken0Units = 10 ** context.token0Decimals;
-            uint256 negativePortfolioBase = token0InLp * uint256(context.price0) / negativeToken0Units
-                + token1InLp * uint256(context.price1) / (10 ** context.token1Decimals);
-            uint256 negativeExposureToken0 = target + excessToken0;
-            uint256 negativeExposureBase = negativeExposureToken0 * uint256(context.price0) / negativeToken0Units;
-            exposureBps =
-                negativePortfolioBase == 0 ? type(uint256).max : negativeExposureBase * BPS / negativePortfolioBase;
-            driftBps = target == 0 ? type(uint256).max : negativeExposureToken0 * BPS / target;
-            return (driftBps, exposureBps, false, 1);
-        }
-        uint256 effectiveShort = uint256(context.effectiveShortToken0);
-        direction = target > effectiveShort ? 1 : target < effectiveShort ? 2 : 0;
-        uint256 exposureToken0 = _absDiff(effectiveShort, target);
+        int256 short = context.effectiveShortToken0;
+        direction = int256(target) > short ? 1 : int256(target) < short ? 2 : 0;
+        uint256 exposureToken0 = direction == 1 ? uint256(int256(target) - short) : uint256(short - int256(target));
         uint256 token0Units = 10 ** context.token0Decimals;
         uint256 portfolioBase = token0InLp * uint256(context.price0) / token0Units
             + token1InLp * uint256(context.price1) / (10 ** context.token1Decimals);
         uint256 exposureBase = exposureToken0 * uint256(context.price0) / token0Units;
         exposureBps = portfolioBase == 0 ? type(uint256).max : exposureBase * BPS / portfolioBase;
-        if (target == 0) return (effectiveShort > 0 ? type(uint256).max : 0, exposureBps, false, direction);
-        Projection memory projected = _projectHedgeState(context, risk, target, effectiveShort);
-        return (projected.hedgeDriftBps, exposureBps, projected.admissible, direction);
+        if (target == 0) return (exposureToken0 > 0 ? type(uint256).max : 0, exposureBps, false, direction);
+        driftBps = exposureToken0 * BPS / target;
+        uint256 idle = uint256(int256(context.debtToken0) - short);
+        bool inventoryRemaining;
+        if (direction == 1 && idle > 0) {
+            uint256 needed = _min(exposureToken0, idle);
+            uint256 amount0 = _min(needed, context.maxInventorySwapToken0);
+            if (amount0 == 0) return (driftBps, exposureBps, false, direction);
+            inventoryRemaining = amount0 < needed;
+            context.idleStableBase +=
+                amount0 * uint256(context.price0) / token0Units * (BPS - context.swapSlippageBps) / BPS;
+            short += int256(amount0);
+        }
+        // A bounded inventory-only leg adds collateral without increasing debt, even if the
+        // effective short stays negative. Check the same reserve and stressed HF after reserve rebuild.
+        Projection memory projected = inventoryRemaining
+            ? _projectHedgeState(context, risk, 1, 1)
+            : _projectHedgeState(context, risk, target, uint256(short));
+        return (driftBps, exposureBps, projected.admissible, direction);
     }
 
     function selectAction(ActionInput memory input)

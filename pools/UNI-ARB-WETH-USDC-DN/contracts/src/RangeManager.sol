@@ -403,14 +403,18 @@ contract RangeManager is Ownable, ReentrancyGuard {
      * @notice Send token0 or token1 to the hedge manager for debt repayment
      * @dev Used by DN bot after rebalance when ETH exposure decreased
      */
-    function sendTokenForHedge(address token, uint256 amount, address to) external onlyAuthorized {
+    function sendTokenForHedge(address token, uint256 amount, address to) external {
         require(token == token0 || token == token1, "E24b");
-        require(amount > 0, "E25");
+        if (amount == 0) revert E99();
         // SÉCURITÉ (audit V1) : destination FIGÉE au hedgeManager (lu depuis le vault). Avant, `to` était
         // arbitraire → une clé bot compromise pouvait envoyer le principal user idle vers une adresse
         // externe. On garde le param `to` (selector inchangé) mais il DOIT = vault.hedgeManager().
         address hm = IMultiUserVault(vault).hedgeManager();
         require(to == hm && hm != address(0), "E95"); // destination figée au hedgeManager
+        // Registered HM may pull only token0 for its atomic inventory normalization.
+        if (!(msg.sender == owner() || authorizedExecutors[msg.sender] || (msg.sender == hm && token == token0))) {
+            revert E99();
+        }
         IERC20(token).safeTransfer(to, amount);
         emit TokenSentForHedge(token, amount, to);
     }

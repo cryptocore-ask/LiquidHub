@@ -707,29 +707,22 @@ contract AaveHedgeManager is ReentrancyGuard {
         //    int256 OBLIGATOIRE : si idle > dette (ex. donation), effectiveShort < 0 => sous-hedge AGGRAVE.
         //    Anti-grief donation : on ne compte que la PART AU-DELA du seuil dust (pas tout-ou-rien), et on
         //    filtre AUSSI le token0 du HedgeManager (sinon une donation au HM force un sous-hedge artificiel = DoS).
-        (uint256 currentDebtWeth, int256 effectiveShort) = RangeStrategyDnLib.normalizeNegativeEffectiveShort();
-        if (effectiveShort < 0) revert HedgeCheck(57);
+        (uint256 currentDebtWeth, int256 effectiveShort, bool inventoryRemaining, uint256 normalized0) =
+            RangeStrategyDnLib.prepareHedgeInventory(targetShort, enforceThresholds);
         bool borrowed = effectiveShort < int256(targetShort);
-        uint256 diff =
-            borrowed ? uint256(int256(targetShort) - effectiveShort) : uint256(effectiveShort - int256(targetShort));
-        if (targetShort == 0) revert HedgeCheck(44);
-        uint256 driftBps = (diff * 10000) / targetShort;
-        if (
-            enforceThresholds && block.timestamp < uint256(lastHedgeAdjustAt) + uint256(hedgeAdjustCooldown)
-                && driftBps < uint256(criticalHedgeBps)
-        ) revert HedgeCheck(41);
-        if (enforceThresholds && driftBps < uint256(adjustHedgeBps)) revert HedgeCheck(44);
+        uint256 diff = inventoryRemaining
+            ? 0
+            : borrowed ? uint256(int256(targetShort) - effectiveShort) : uint256(effectiveShort - int256(targetShort));
         bool bountyEligible =
             DnDepositLib.rawDebtDriftExceeds(currentDebtWeth, targetShort, adjustHedgeBps, donationDustToken0);
 
-        if (diff == 0) {
+        if (diff == 0 && normalized0 == 0) {
             _requireHfMin();
             return;
         }
-
-        if (borrowed) {
+        if (diff > 0 && borrowed) {
             _increaseEffectiveShort(diff);
-        } else {
+        } else if (diff > 0) {
             // Repay d'abord grace au flash loan, puis seulement retirer le collateral rendu disponible.
             _flashLoanActive = true;
             pool.flashLoanSimple(
@@ -738,19 +731,19 @@ contract AaveHedgeManager is ReentrancyGuard {
             _flashLoanActive = false;
         }
 
-        // Reset du cooldown : un vrai ajustement du delta vient d'avoir lieu.
-        lastHedgeAdjustAt = uint64(block.timestamp);
+        // Do not strand the remainder of a capped inventory correction behind a new cooldown.
+        if (!inventoryRemaining) lastHedgeAdjustAt = uint64(block.timestamp);
 
         _rebuildReserve();
 
         _requireHfMin();
 
         // Bounty silent, uniquement apres correction et post-checks complets.
-        if (payBounty && bountyEligible && treasuryAddress != address(0)) {
+        if (payBounty && !inventoryRemaining && diff > 0 && bountyEligible && treasuryAddress != address(0)) {
             try IHedgeTreasury(treasuryAddress).payHedgeBounty(keeper) {} catch {}
         }
 
-        emit HedgeAdjusted(currentDebtWeth, targetShort, borrowed, keeper);
+        emit HedgeAdjusted(currentDebtWeth, targetShort, borrowed && diff > 0, keeper);
     }
 
     /// @dev Apres un repay, libere le collateral AAVE excedentaire (au-dela du HF cible) vers ce
