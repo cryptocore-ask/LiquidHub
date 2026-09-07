@@ -48,6 +48,7 @@ interface IDnNegativeHedgeContext {
 
 interface IDnAaveSupply {
     function supply(address asset, uint256 amount, address onBehalfOf, uint16 referralCode) external;
+    function repay(address asset, uint256 amount, uint256 rateMode, address onBehalfOf) external returns (uint256);
 }
 
 interface IDnAaveStrategyState {
@@ -91,15 +92,14 @@ library RangeStrategyDnLib {
     error HedgeCheck(uint8 code);
 
     event HedgeInventoryNormalized(uint256 amount0, uint256 amount1, bool complete);
+    event RepayDebt(uint256 wethRepaid);
 
-    function aaveBorrowRateRay(address hedgeManager) external view returns (bool available, uint256 rateRay) {
+    function _aaveBorrowRateRay(address hedgeManager, address token0) private view returns (bool available, uint256 rateRay) {
         (bool poolOk, bytes memory poolData) = hedgeManager.staticcall(abi.encodeWithSignature("pool()"));
-        (bool assetOk, bytes memory assetData) = hedgeManager.staticcall(abi.encodeWithSignature("weth()"));
-        if (!poolOk || !assetOk || poolData.length < 32 || assetData.length < 32) return (false, 0);
+        if (!poolOk || poolData.length < 32) return (false, 0);
         address aavePool = abi.decode(poolData, (address));
-        address asset = abi.decode(assetData, (address));
         (bool reserveOk, bytes memory reserveData) =
-            aavePool.staticcall(abi.encodeWithSignature("getReserveData(address)", asset));
+            aavePool.staticcall(abi.encodeWithSignature("getReserveData(address)", token0));
         if (!reserveOk || reserveData.length < 5 * 32) return (false, 0);
         assembly ("memory-safe") {
             rateRay := mload(add(reserveData, 0xa0))
@@ -120,22 +120,28 @@ library RangeStrategyDnLib {
         uint256 dustFloor = context.donationDustToken0();
         uint256 idleHm;
         (debt, effectiveShort, idleHm) = _effectiveShort(context.variableDebtWeth(), token0, rangeManager, dustFloor);
-        if (target == 0) revert HedgeCheck(44);
-        uint256 difference = effectiveShort < int256(target)
+        // Above the range, only reduce a net LONG inventory. Never create a short
+        // against an all-stable LP or repay the whole hedge merely because its target is zero.
+        if (target == 0 && !enforceThresholds) revert HedgeCheck(44);
+        bool inventoryRepay = target == 0 && effectiveShort >= 0;
+        uint256 difference = inventoryRepay ? debt : effectiveShort < int256(target)
             ? uint256(int256(target) - effectiveShort)
             : uint256(effectiveShort - int256(target));
         if (enforceThresholds) {
             IDnAaveStrategyState hedge = IDnAaveStrategyState(address(this));
-            uint256 drift = difference * BPS / target;
+            uint256 drift = target == 0 ? type(uint256).max : difference * BPS / target;
             if (
                 block.timestamp < uint256(hedge.lastHedgeAdjustAt()) + hedge.hedgeAdjustCooldown()
                     && drift < hedge.criticalHedgeBps()
             ) revert HedgeCheck(41);
             if (drift < hedge.adjustHedgeBps()) revert HedgeCheck(44);
         }
-        if (effectiveShort >= int256(target)) return (debt, effectiveShort, false, 0);
-        uint256 idle = uint256(int256(debt) - effectiveShort);
-        if (idle == 0) return (debt, effectiveShort, false, 0);
+        if (!inventoryRepay && effectiveShort >= int256(target)) return (debt, effectiveShort, false, 0);
+        uint256 idle = inventoryRepay ? idleHm : uint256(int256(debt) - effectiveShort);
+        if (idle == 0) {
+            if (inventoryRepay) revert HedgeCheck(44);
+            return (debt, effectiveShort, false, 0);
+        }
         IDnRangeManagerState(rangeManager).refreshPriceCache();
         (uint128 price0, uint128 price1, uint160 sqrtP,,, bool valid) = IDnRangeManagerState(rangeManager).priceCache();
         if (!(valid && price0 > 0 && price1 > 0 && sqrtP > 0)) revert InvalidNegativeHedgeSwap();
@@ -143,7 +149,19 @@ library RangeStrategyDnLib {
         address token1 = context.usdc();
         uint256 amount0 = _min(_min(difference, idle), _inventoryCap(rangeManager, price0, context.volatileDecimals()));
         if (amount0 == 0) revert InvalidNegativeHedgeSwap();
-        inventoryRemaining = amount0 < _min(difference, idle);
+        // A zero-target inventory step is followed by a range decision, with no new
+        // borrowing, bounty or cooldown even when the net long has been eliminated.
+        inventoryRemaining = target == 0 || amount0 < _min(difference, idle);
+        if (inventoryRepay) {
+            // A capped repayment from HM inventory removes matching assets and debt:
+            // no swap, no new delta, no extra debt. It makes a large residual inventory
+            // manageable by a subsequent atomic range sync without exceeding its cap.
+            if (IDnAaveSupply(context.pool()).repay(token0, amount0, 2, address(this)) != amount0) {
+                revert InvalidNegativeHedgeSwap();
+            }
+            emit RepayDebt(amount0);
+            return (debt, effectiveShort, true, amount0);
+        }
         if (amount0 > idleHm) {
             IDnRangeManagerState(rangeManager).sendTokenForHedge(token0, amount0 - idleHm, address(this));
         }
@@ -332,9 +350,7 @@ library RangeStrategyDnLib {
     function loadContext(
         address hedgeManager,
         address rangeManager,
-        address token0,
-        bool rateAvailable,
-        uint256 rateRay
+        address token0
     ) external view returns (Context memory context) {
         IDnAaveStrategyState hedge = IDnAaveStrategyState(hedgeManager);
         try hedge.getHedgeData() returns (uint256 collateral, uint256 debtBase, uint256 hf, uint256 available) {
@@ -388,6 +404,7 @@ library RangeStrategyDnLib {
         context.criticalHedgeBps = hedge.criticalHedgeBps();
         context.cooldownSeconds = hedge.hedgeAdjustCooldown();
         context.lastAdjustmentAt = hedge.lastHedgeAdjustAt();
+        (bool rateAvailable, uint256 rateRay) = _aaveBorrowRateRay(hedgeManager, token0);
         if (!rateAvailable) return context;
         context.variableBorrowRateRay = rateRay;
         context.configured = context.price0 > 0 && context.price1 > 0 && context.variableBorrowRateRay > 0
@@ -588,11 +605,11 @@ library RangeStrategyDnLib {
 
         uint256 targetShort = _candidateTargetShort(context, position, lower, upper, liveTick);
         if (targetShort == 0) return (false, 0, 0);
-        uint256 effectiveShort = _candidateEffectiveShort(context, position.exists);
-        Projection memory projected = _projectHedgeState(context, risk, targetShort, effectiveShort);
+        int256 effectiveShort = _candidateEffectiveShort(context);
+        Projection memory projected = _projectHedgeState(context, risk, targetShort, effectiveShort, false);
         if (!projected.admissible) return (false, 0, projected.hedgeDriftBps);
 
-        uint256 turnoverPenalty = _min(_absDiff(targetShort, effectiveShort) * BPS / targetShort / 4, 2000);
+        uint256 turnoverPenalty = _min(projected.hedgeDriftBps / 4, 2000);
         uint256 horizonRateBps =
             context.variableBorrowRateRay * risk.strategicHorizonSeconds * BPS / (uint256(1e27) * 365 days);
         if (horizonRateBps == 0) horizonRateBps = 1;
@@ -628,7 +645,8 @@ library RangeStrategyDnLib {
         if (low > high) return (0, 0, false);
         int256 minimumSearchCenter = low;
         int256 maximumSearchCenter = high;
-        uint256 effectiveShort = _candidateEffectiveShort(context, position.exists);
+        int256 signedShort = _candidateEffectiveShort(context);
+        uint256 effectiveShort = signedShort < 0 ? 0 : uint256(signedShort);
         uint256 bestDifference = type(uint256).max;
 
         for (uint256 iteration; iteration < 12 && low <= high; ++iteration) {
@@ -754,7 +772,10 @@ library RangeStrategyDnLib {
             _hedgeOnlyStatus(context, position, risk, liveTick);
         // Keep the calibrated economic filter for ordinary maintenance. A queued deposit
         // cannot wait for a hedge that the admission guard requires but this filter forbids.
-        bool exposureLargeEnough = control.exposureBps >= minimumHedgeDeltaBps || context.depositPending;
+        // At a zero LP target, a feasible inventory-only step never adds debt or short
+        // exposure. A small final remainder must not strand an otherwise capped recovery.
+        bool exposureLargeEnough = control.exposureBps >= minimumHedgeDeltaBps || context.depositPending
+            || control.driftBps == type(uint256).max;
         (control.signalSince, control.direction, control.normalConfirmed) = _nextHedgeSignal(
             previousSignalSince,
             previousDirection,
@@ -818,24 +839,18 @@ library RangeStrategyDnLib {
             + token1InLp * uint256(context.price1) / (10 ** context.token1Decimals);
         uint256 exposureBase = exposureToken0 * uint256(context.price0) / token0Units;
         exposureBps = portfolioBase == 0 ? type(uint256).max : exposureBase * BPS / portfolioBase;
-        if (target == 0) return (exposureToken0 > 0 ? type(uint256).max : 0, exposureBps, false, direction);
-        driftBps = exposureToken0 * BPS / target;
-        uint256 idle = uint256(int256(context.debtToken0) - short);
-        bool inventoryRemaining;
-        if (direction == 1 && idle > 0) {
-            uint256 needed = _min(exposureToken0, idle);
-            uint256 amount0 = _min(needed, context.maxInventorySwapToken0);
-            if (amount0 == 0) return (driftBps, exposureBps, false, direction);
-            inventoryRemaining = amount0 < needed;
-            context.idleStableBase +=
-                amount0 * uint256(context.price0) / token0Units * (BPS - context.swapSlippageBps) / BPS;
-            short += int256(amount0);
+        if (target == 0 && short >= 0) {
+            uint256 hmIdle = uint256(int256(context.debtToken0) - short) - context.countedIdleRmToken0;
+            uint256 repay = _min(_min(hmIdle, context.debtToken0), context.maxInventorySwapToken0);
+            if (repay == 0) return (exposureToken0 > 0 ? type(uint256).max : 0, exposureBps, false, direction);
+            uint256 repaidBase = repay * uint256(context.price0) / token0Units;
+            Projection memory afterRepay;
+            afterRepay.debtBase = context.debtBase - _min(repaidBase, context.debtBase);
+            _checkProjectedCollateral(context, risk, afterRepay, context.collateralBase + context.idleStableBase);
+            return (type(uint256).max, exposureBps, afterRepay.admissible, 3);
         }
-        // A bounded inventory-only leg adds collateral without increasing debt, even if the
-        // effective short stays negative. Check the same reserve and stressed HF after reserve rebuild.
-        Projection memory projected = inventoryRemaining
-            ? _projectHedgeState(context, risk, 1, 1)
-            : _projectHedgeState(context, risk, target, uint256(short));
+        driftBps = target == 0 ? type(uint256).max : exposureToken0 * BPS / target;
+        Projection memory projected = _projectHedgeState(context, risk, target, short, true);
         return (driftBps, exposureBps, projected.admissible, direction);
     }
 
@@ -1012,45 +1027,58 @@ library RangeStrategyDnLib {
         int24 upper,
         int24 liveTick
     ) private pure returns (uint256) {
-        uint256 candidateToken0;
+        (uint256 amount0, uint256 amount1) =
+            RangeOperations.strategyAmountsAtTick(lower, upper, liveTick, SAMPLE_LIQUIDITY);
+        uint256 value = amount0 * uint256(context.price0) / (10 ** context.token0Decimals)
+            + amount1 * uint256(context.price1) / (10 ** context.token1Decimals);
+        if (value == 0) return 0;
+        // RM balances are reminted together with the released NFT, in ordinary
+        // rebalances as well as recovery. They are not also available to finance the hedge.
+        uint256 candidateToken0 = Math.mulDiv(amount0, context.idleRmValueBase, value);
         if (position.exists) {
-            candidateToken0 = RangeOperations.strategyCandidateToken0ForCurrentValue(
+            candidateToken0 += RangeOperations.strategyCandidateToken0ForCurrentValue(
                 position.lower, position.upper, lower, upper, liveTick, position.liquidity
             );
-        } else {
-            (uint256 amount0, uint256 amount1) =
-                RangeOperations.strategyAmountsAtTick(lower, upper, liveTick, SAMPLE_LIQUIDITY);
-            uint256 value = amount0 * uint256(context.price0) / (10 ** context.token0Decimals)
-                + amount1 * uint256(context.price1) / (10 ** context.token1Decimals);
-            if (value == 0) return 0;
-            candidateToken0 = Math.mulDiv(amount0, context.idleRmValueBase, value);
         }
         return candidateToken0 * context.hedgeTargetBps / BPS;
     }
 
-    function _candidateEffectiveShort(Context memory context, bool positionExists) private pure returns (uint256) {
-        // During recovery the released RM token0 is allocated to the new NFT, so it
+    function _candidateEffectiveShort(Context memory context) private pure returns (int256) {
+        // The released RM token0 is allocated to the new NFT, so it
         // must not ALSO be subtracted from the short used to finance that NFT.
-        int256 short = context.effectiveShortToken0;
-        if (!positionExists) short += int256(context.countedIdleRmToken0);
-        return short < 0 ? 0 : uint256(short);
+        return context.effectiveShortToken0 + int256(context.countedIdleRmToken0);
     }
 
     function _projectHedgeState(
         Context memory context,
         RiskConfig memory risk,
         uint256 targetShort,
-        uint256 effectiveShort
+        int256 effectiveShort,
+        bool allowInventoryStep
     ) private pure returns (Projection memory projected) {
-        if (!context.configured || targetShort == 0) return projected;
-        projected.hedgeDriftBps = _absDiff(targetShort, effectiveShort) * BPS / targetShort;
+        if (!context.configured || (targetShort == 0 && (!allowInventoryStep || effectiveShort >= 0))) return projected;
+        uint256 difference = int256(targetShort) >= effectiveShort
+            ? uint256(int256(targetShort) - effectiveShort) : uint256(effectiveShort - int256(targetShort));
+        projected.hedgeDriftBps = targetShort == 0 ? type(uint256).max : difference * BPS / targetShort;
         uint256 units = 10 ** context.token0Decimals;
+        uint256 idleStableBase = context.idleStableBase;
+        bool inventoryRemaining;
+        if (effectiveShort < int256(targetShort) && effectiveShort < int256(context.debtToken0)) {
+            uint256 needed = _min(difference, uint256(int256(context.debtToken0) - effectiveShort));
+            uint256 amount0 = _min(needed, context.maxInventorySwapToken0);
+            if (amount0 == 0 || (!allowInventoryStep && amount0 < needed)) return projected;
+            inventoryRemaining = amount0 < needed;
+            effectiveShort += int256(amount0);
+            idleStableBase += amount0 * uint256(context.price0) / units * (BPS - context.swapSlippageBps) / BPS;
+        }
         uint256 targetBase = targetShort * uint256(context.price0) / units;
-        uint256 currentEffectiveBase = effectiveShort * uint256(context.price0) / units;
-        uint256 stableAssetsBase = context.collateralBase + context.idleStableBase;
-        if (targetBase >= currentEffectiveBase) {
+        uint256 currentEffectiveBase = effectiveShort > 0 ? uint256(effectiveShort) * uint256(context.price0) / units : 0;
+        uint256 stableAssetsBase = context.collateralBase + idleStableBase;
+        if (inventoryRemaining) {
+            projected.debtBase = context.debtBase;
+        } else if (targetBase >= currentEffectiveBase) {
             uint256 additionalBorrowBase = targetBase - currentEffectiveBase;
-            uint256 reserveBorrowCapacity = context.idleStableBase * context.borrowLtvBps / BPS;
+            uint256 reserveBorrowCapacity = idleStableBase * context.borrowLtvBps / BPS;
             if (additionalBorrowBase > context.availableBorrowsBase + reserveBorrowCapacity) return projected;
             projected.debtBase = context.debtBase + additionalBorrowBase;
             stableAssetsBase += additionalBorrowBase * (BPS - context.swapSlippageBps) / BPS;
@@ -1064,26 +1092,29 @@ library RangeStrategyDnLib {
             if (conservativeWithdrawal >= stableAssetsBase) return projected;
             stableAssetsBase -= conservativeWithdrawal;
         }
-        if (projected.debtBase == 0) {
-            projected.collateralBase = stableAssetsBase;
-        } else {
-            uint256 minimumCollateral =
-                _ceilDiv(projected.debtBase * context.reserveHfTargetBps, context.liquidationThresholdBps);
-            if (stableAssetsBase < minimumCollateral) return projected;
+        _checkProjectedCollateral(context, risk, projected, stableAssetsBase);
+    }
+
+    function _checkProjectedCollateral(
+        Context memory context,
+        RiskConfig memory risk,
+        Projection memory projected,
+        uint256 stableAssetsBase
+    ) private pure {
+        projected.collateralBase = stableAssetsBase;
+        if (projected.debtBase > 0) {
             uint256 operatingTarget =
                 _ceilDiv(projected.debtBase * context.operationalHfTargetBps, context.liquidationThresholdBps);
             projected.collateralBase = _min(stableAssetsBase, operatingTarget);
         }
-        if (
-            projected.debtBase > 0
-                && projected.collateralBase * context.liquidationThresholdBps / projected.debtBase
-                    < context.reserveHfTargetBps
-        ) return projected;
         uint256 stressedDebt = projected.debtBase * (BPS + risk.tailRiskBps) / BPS;
+        // floor(collateral * liquidationThreshold / debt) >= HF is exactly
+        // collateral * liquidationThreshold >= debt * HF, including equality.
+        // This also implies the minimum-collateral requirement, without rounding twice.
         if (
-            stressedDebt > 0
-                && projected.collateralBase * context.liquidationThresholdBps / stressedDebt < risk.minStressHfBps
-        ) return projected;
+            projected.collateralBase * context.liquidationThresholdBps
+                < _max(projected.debtBase * context.reserveHfTargetBps, stressedDebt * risk.minStressHfBps)
+        ) return;
         projected.admissible = true;
     }
 

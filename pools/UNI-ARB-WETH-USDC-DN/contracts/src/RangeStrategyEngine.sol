@@ -620,7 +620,8 @@ contract RangeStrategyEngine is Ownable, ReentrancyGuard, IRangeStrategyEngine {
         _hedgeSignalSince = hedgeControl.signalSince;
         _hedgeSignalDirection = hedgeControl.direction;
         // Normalize idle token0 through the ordinary hedge lane before considering an LP burn/remint.
-        if (hedgeControl.eligible && hedgeControl.direction == 1 && dn.effectiveShortToken0 < int256(dn.debtToken0)) {
+        if (hedgeControl.eligible && hedgeControl.direction == 1 && hedgeControl.driftBps != type(uint256).max
+            && dn.effectiveShortToken0 < int256(dn.debtToken0)) {
             _hedgeRecoverySince = 0;
             decision.action = Action.HEDGE_ONLY;
             decision.reason = ReasonCode.HEDGE_DRIFT;
@@ -662,6 +663,13 @@ contract RangeStrategyEngine is Ownable, ReentrancyGuard, IRangeStrategyEngine {
             }
         }
         if (forceHedgeRecovery) best = bestRecovery;
+
+        // An inventory repayment is a fallback for an inadmissible range, never a
+        // reason to churn debt or change the ordinary range timing when it can recover.
+        if (hedgeControl.direction == 3) {
+            hedgeControl.eligible = false;
+            hedgeControl.critical = false;
+        }
 
         decision.targetTickLower = best.lower;
         decision.targetTickUpper = best.upper;
@@ -743,8 +751,7 @@ contract RangeStrategyEngine is Ownable, ReentrancyGuard, IRangeStrategyEngine {
     }
 
     function _dnContext() private view returns (RangeStrategyDnLib.Context memory dn) {
-        (bool rateAvailable, uint256 rateRay) = RangeStrategyDnLib.aaveBorrowRateRay(hedgeManager);
-        dn = RangeStrategyDnLib.loadContext(hedgeManager, rangeManager, _strategyToken0, rateAvailable, rateRay);
+        dn = RangeStrategyDnLib.loadContext(hedgeManager, rangeManager, _strategyToken0);
         if (dn.configured) dn.depositPending = IStrategyDepositVault(_strategyVault).getPendingDepositsCount() > 0;
     }
 

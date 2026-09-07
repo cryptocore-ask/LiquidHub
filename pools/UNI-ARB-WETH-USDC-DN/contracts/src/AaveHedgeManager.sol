@@ -697,9 +697,9 @@ contract AaveHedgeManager is ReentrancyGuard {
         );
 
         // 2. Cible de SHORT (DN strict par defaut) : targetShort = hedgeTargetBps/10000 * token0InLP.
-        //    Hors range haut, token0InLP peut etre nul. Le repay courant est alors refuse : le rebalance
-        //    atomique doit conserver la dette existante et reconstruire la position centree. La reparation
-        //    urgente du HF reste disponible plus haut, independamment de cette garde.
+        //    Hors range haut, la voie ordinaire ne rachete pas toute la dette au marche.
+        //    Le rebalance reconstruit la position ; si l'inventaire libre depasse son plafond,
+        //    seules des etapes sans nouvelle dette/exposition le rendent executable.
         //    token0 peut etre WETH, WBTC ou tout autre volatil de la pool ; les decimales viennent de la config.
         uint256 targetShort = (token0InLP * uint256(hedgeTargetBps)) / 10000;
 
