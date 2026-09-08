@@ -249,8 +249,8 @@ async function assertKeeperTopology(rpcPool, { rangeManager, vault, strategyEngi
   if (Number(topology.engineProfile) !== expectedProfile) {
     throw new Error(`Keeper topology: engine profile does not match STRATEGY_PROFILE=${configuredProfile}`);
   }
-  if (Number(topology.engineMode) !== 1) {
-    throw new Error('Keeper topology: RangeStrategyEngine must use HYBRID mode');
+  if (![0, 1].includes(Number(topology.engineMode))) {
+    throw new Error('Keeper topology: RangeStrategyEngine must use ANALYTIC_ONLY or HYBRID mode');
   }
   if (Number(topology.engineVersion) !== 2) {
     throw new Error(`Keeper topology: ${configuredProfile} requires RangeStrategyEngine version 2`);
@@ -263,7 +263,34 @@ async function assertKeeperTopology(rpcPool, { rangeManager, vault, strategyEngi
   }
 }
 
+/**
+ * Optional remuneration must never gate a financially valid maintenance action.
+ * Returns false for a known funding shortage, null for an unavailable read,
+ * and true otherwise. Callers log this information and still run maintenance.
+ */
+async function checkBountyFunding(label, prefix, treasury, treasuryAddr, usdc, rpcPool) {
+  if (!treasury || !treasuryAddr || !usdc) return true;
+  try {
+    return await rpcPool.executeWithRetry(async (provider) => {
+      const contract = treasury.connect(provider);
+      if (!await contract[`${prefix}BountyEnabled`]()) return true;
+      const amount = await contract[`${prefix}BountyAmount`]();
+      const balance = await usdc.connect(provider).balanceOf(treasuryAddr);
+      if (balance < amount) {
+        console.log(`  Treasury insufficiently funded for ${label} bounty (` +
+          `${ethers.formatUnits(balance, 6)} < ${ethers.formatUnits(amount, 6)} USDC) — action will execute without a bounty`);
+        return false;
+      }
+      return true;
+    });
+  } catch (_) {
+    console.warn(`  ${label} bounty information unavailable — remuneration unknown; maintenance continues`);
+    return null;
+  }
+}
+
 module.exports = {
+  checkBountyFunding,
   RANGEMANAGER_ABI,
   RANGE_STRATEGY_ENGINE_ABI,
   STRATEGY_ACTION,

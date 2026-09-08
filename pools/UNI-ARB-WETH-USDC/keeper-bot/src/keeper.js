@@ -8,6 +8,7 @@ const {
   createContracts,
   syncCurrentBotModule,
   assertKeeperTopology,
+  checkBountyFunding,
   TREASURY_ABI,
   ERC20_ABI,
   STRATEGY_ACTION,
@@ -67,25 +68,6 @@ async function resolveTreasury(rpcPool, vault) {
   } catch (e) {
     return { treasury: null, treasuryAddr: null, usdc: null };
   }
-}
-
-/**
- * Logs a warning if the Treasury USDC balance is below the bounty amount. The action itself
- * always succeeds on-chain (the contract wraps the payout in try/catch) — only the bounty is
- * skipped silently when the Treasury is empty. Returns true if the bounty looks payable.
- */
-async function checkBountyFunding(label, enabled, amount, treasuryAddr, usdc, rpcPool) {
-  if (!enabled || !usdc || !treasuryAddr) return true;
-  try {
-    const bal = await readContract(rpcPool, usdc, 'balanceOf', treasuryAddr);
-    if (bal < amount) {
-      console.log(`  ⚠️  Treasury insufficiently funded for ${label} bounty (` +
-        `${ethers.formatUnits(bal, 6)} < ${ethers.formatUnits(amount, 6)} USDC) — ` +
-        `action will execute, no bounty paid`);
-      return false;
-    }
-  } catch (_) { /* balance read failed — don't block the action */ }
-  return true;
 }
 
 async function trackAction(alerts, method, ...args) {
@@ -292,20 +274,7 @@ async function main() {
           console.log('  -> Strategy checkpoint due (check-only mode, skipping transaction)');
         } else {
         try {
-            const checkpointEnabled = treasury
-              ? await readContract(rpcPool, treasury, 'strategyCheckpointBountyEnabled')
-              : false;
-            const checkpointAmount = treasury
-              ? await readContract(rpcPool, treasury, 'strategyCheckpointBountyAmount')
-              : 0n;
-            await checkBountyFunding(
-              'strategy checkpoint',
-              checkpointEnabled,
-              checkpointAmount,
-              treasuryAddr,
-              usdc,
-              rpcPool
-            );
+            await checkBountyFunding('strategy checkpoint', 'strategyCheckpoint', treasury, treasuryAddr, usdc, rpcPool);
             console.log('  -> Recording canonical strategy checkpoint...');
             const receipt = await rpcPool.executeSignedTxWithRetry(async (p) => {
               const signer = wallet.connect(p);
@@ -373,9 +342,7 @@ async function main() {
             console.log(`  Deposit deferred: ${actionLabel} is eligible (${reasonLabel})`);
           } else if (!isRebalancing) {
             await trackAction(actionAlerts, 'success', 'mint', 'Initial position is available');
-            const depEnabled = treasury ? await readContract(rpcPool, treasury, 'depositBountyEnabled') : false;
-            const depAmount = treasury ? await readContract(rpcPool, treasury, 'depositBountyAmount') : 0n;
-            await checkBountyFunding('deposit', depEnabled, depAmount, treasuryAddr, usdc, rpcPool);
+            await checkBountyFunding('deposit', 'deposit', treasury, treasuryAddr, usdc, rpcPool);
             console.log(`  -> ${pending.toString()} deposit(s) pending, processing one on-chain...`);
             const result = await rebalancer.processDeposit();
             if (result.success) {
@@ -399,9 +366,7 @@ async function main() {
       } else if (CHECK_ONLY) {
         console.log('  -> Rebalance needed (check-only mode, skipping)\n');
       } else {
-        const keeperEnabled = treasury ? await readContract(rpcPool, treasury, 'keeperBountyEnabled') : false;
-        const keeperAmount = treasury ? await readContract(rpcPool, treasury, 'keeperBountyAmount') : 0n;
-        await checkBountyFunding('rebalance', keeperEnabled, keeperAmount, treasuryAddr, usdc, rpcPool);
+        await checkBountyFunding('rebalance', 'keeper', treasury, treasuryAddr, usdc, rpcPool);
         console.log('  -> Executing REBALANCE...');
         const result = await rebalancer.executeRebalance(tokenId, decision.decisionHash);
         if (result.noAction) {

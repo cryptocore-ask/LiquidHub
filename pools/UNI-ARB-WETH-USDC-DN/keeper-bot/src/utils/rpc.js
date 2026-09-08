@@ -1,17 +1,15 @@
 // SPDX-License-Identifier: MIT
 
 const { ethers } = require('ethers');
-const crypto = require('node:crypto');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
+const { acquireSignerFileLock, assertSignerFileLock, isSignerLockOwnerAlive } = require('./signer-file-lock');
 
 const RPC_READ_TIMEOUT_MS = 20_000;
 const RPC_TX_TIMEOUT_MS = 90_000;
 const SIGNER_LOCK_TIMEOUT_MS = 5 * 60_000;
 const SIGNER_LOCK_POLL_MS = 250;
-const SIGNER_LOCK_HEARTBEAT_MS = 5_000;
-const SIGNER_LOCK_STALE_MS = 2 * 60_000;
 const HF_REPAIR_DATA = '0x30cbb735'; // repairHealthFactor()
 
 function readPositiveGweiEnv(name) {
@@ -137,6 +135,7 @@ class RPCPool {
   }
 
   _migrateLegacyPendingTx() {
+    this._assertSignerLock();
     const legacyFile = this.configuredPendingTxFile;
     if (!legacyFile || legacyFile === this.pendingTxFile || !fs.existsSync(legacyFile)) return;
     if (fs.existsSync(this.pendingTxFile)) {
@@ -232,84 +231,24 @@ class RPCPool {
   }
 
   _isLockOwnerAlive(lock) {
-    if (!Number.isInteger(lock?.pid) || lock.pid <= 0) return false;
-    try {
-      if (Date.now() - fs.statSync(this.processLockFile).mtimeMs > SIGNER_LOCK_STALE_MS) return false;
-    } catch {
-      return false;
-    }
-    try {
-      process.kill(lock.pid, 0);
-      return true;
-    } catch (error) {
-      return error.code === 'EPERM';
-    }
+    return isSignerLockOwnerAlive(lock);
+  }
+
+  _assertSignerLock() {
+    assertSignerFileLock(this.processLockFile);
   }
 
   async _withSignerLock(provider, fn) {
     await this._ensureSignerState(provider);
-    const token = crypto.randomUUID();
-    const deadline = Date.now() + SIGNER_LOCK_TIMEOUT_MS;
-    while (Date.now() < deadline) {
-      try {
-        const fd = fs.openSync(this.processLockFile, 'wx', 0o600);
-        fs.writeFileSync(fd, `${JSON.stringify({
-          pid: process.pid,
-          token,
-          signer: this.signerAddress,
-          chainId: this.chainId,
-          acquiredAt: new Date().toISOString(),
-        })}\n`);
-        fs.closeSync(fd);
-        const heartbeat = setInterval(() => {
-          try {
-            const current = JSON.parse(fs.readFileSync(this.processLockFile, 'utf8'));
-            if (current.token !== token) return;
-            const now = new Date();
-            fs.utimesSync(this.processLockFile, now, now);
-          } catch {}
-        }, SIGNER_LOCK_HEARTBEAT_MS);
-        heartbeat.unref?.();
-        try {
-          this._migrateLegacyPendingTx();
-          return await fn();
-        } finally {
-          clearInterval(heartbeat);
-          try {
-            const current = JSON.parse(fs.readFileSync(this.processLockFile, 'utf8'));
-            if (current.token === token) fs.unlinkSync(this.processLockFile);
-          } catch {
-            // A dead-process recovery may already have removed the lock.
-          }
-        }
-      } catch (error) {
-        if (error.code !== 'EEXIST') throw error;
-        let lock = null;
-        try {
-          lock = JSON.parse(fs.readFileSync(this.processLockFile, 'utf8'));
-          if (!this._isLockOwnerAlive(lock)) {
-            fs.rmSync(this.processLockFile, { force: true });
-            continue;
-          }
-        } catch (probeError) {
-          const ageMs = (() => {
-            try {
-              return Date.now() - fs.statSync(this.processLockFile).mtimeMs;
-            } catch {
-              return 0;
-            }
-          })();
-          if (ageMs > 5_000) {
-            fs.rmSync(this.processLockFile, { force: true });
-            continue;
-          }
-        }
-        await new Promise(resolve => setTimeout(resolve, SIGNER_LOCK_POLL_MS));
-      }
-    }
-    throw new Error(
-      `Keeper signer lock timeout for ${this.signerAddress} on chain ${this.chainId}`
-    );
+    const lock = await acquireSignerFileLock(this.processLockFile, {
+      timeoutMs: SIGNER_LOCK_TIMEOUT_MS, pollMs: SIGNER_LOCK_POLL_MS,
+    });
+    try {
+      return await lock.run(async () => {
+        this._migrateLegacyPendingTx();
+        return await fn();
+      });
+    } finally { lock.release(); }
   }
 
   _readPendingSignedTx() {
@@ -377,6 +316,7 @@ class RPCPool {
     feeCapExempt = false,
     feeCapExemptTarget = null,
   } = {}) {
+    this._assertSignerLock();
     if (!this.pendingTxFile) return;
     if (!Number.isSafeInteger(nonce) || nonce < 0) {
       throw new Error(`${label}: signed transaction nonce is missing or invalid`);
@@ -403,6 +343,7 @@ class RPCPool {
   }
 
   _clearPersistedSignedTx(expectedHash) {
+    this._assertSignerLock();
     if (!this.pendingTxFile || !fs.existsSync(this.pendingTxFile)) return;
     const pending = this._readPendingSignedTx();
     if (pending.txHash.toLowerCase() !== expectedHash.toLowerCase()) {
@@ -644,7 +585,9 @@ class RPCPool {
       this._assertFeeCap(request, `${pending.label} replacement`);
     }
 
+    this._assertSignerLock();
     const replacementRaw = await this.signerWallet.signTransaction(request);
+    this._assertSignerLock();
     const replacementHash = ethers.keccak256(replacementRaw);
     this._persistSignedTx(replacementRaw, replacementHash, pending.label, pending.nonce, {
       feeCapExempt,
@@ -756,8 +699,9 @@ class RPCPool {
     }
 
     const replacementRaw = await this.withTimeout(
-      () => prepared.wallet.signTransaction(request), RPC_TX_TIMEOUT_MS, `${label} critical preemption signing`
+      () => { this._assertSignerLock(); return prepared.wallet.signTransaction(request); }, RPC_TX_TIMEOUT_MS, `${label} critical preemption signing`
     );
+    this._assertSignerLock();
     const replacementHash = ethers.keccak256(replacementRaw);
     if (prepared.log) prepared.log(replacementHash);
     this._persistSignedTx(replacementRaw, replacementHash, label, previous.nonce, {
@@ -862,8 +806,9 @@ class RPCPool {
 
       // Sign exactly once. Every provider only sees this immutable raw transaction.
       const signedTx = await this.withTimeout(
-        () => prepared.wallet.signTransaction(populated), RPC_TX_TIMEOUT_MS, `${label} signing`
+        () => { this._assertSignerLock(); return prepared.wallet.signTransaction(populated); }, RPC_TX_TIMEOUT_MS, `${label} signing`
       );
+      this._assertSignerLock();
       const parsedSignedTx = ethers.Transaction.from(signedTx);
       const txHash = ethers.keccak256(signedTx);
       if (prepared.log) prepared.log(txHash);
@@ -919,7 +864,7 @@ class RPCPool {
 
         try {
           await this.withTimeout(
-            () => provider.broadcastTransaction(signedTx), RPC_READ_TIMEOUT_MS, `${label} broadcast`
+            () => { this._assertSignerLock(); return provider.broadcastTransaction(signedTx); }, RPC_READ_TIMEOUT_MS, `${label} broadcast`
           );
           console.log(`${label} raw tx ${attempt === 1 ? 'broadcast' : 'rebroadcast'}: ${txHash}`);
         } catch (error) {

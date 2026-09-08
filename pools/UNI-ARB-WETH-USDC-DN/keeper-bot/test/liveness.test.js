@@ -262,7 +262,7 @@ test('signed nonce and broadcast paths never consult a rejected wrong-chain endp
   ];
 
   assert.equal(await pool._latestSignerNonce(), 7);
-  const receipt = await pool._broadcastSignedTransaction('0x1234', '0xabcd', 'rebalance', 0, 1);
+  const receipt = await withSignerContext(pool, () => pool._broadcastSignedTransaction('0x1234', '0xabcd', 'rebalance', 0, 1));
 
   assert.equal(receipt.status, 1);
   assert.equal(correctBroadcasts, 1);
@@ -277,6 +277,20 @@ test('nonce conflicts are not treated as an already-known raw transaction', () =
   assert.equal(pool.isConsumedNonceError(new Error('nonce too low')), true);
   assert.equal(pool.isConsumedNonceError(new Error('nonce has already been used')), true);
 });
+
+const { acquireSignerFileLock } = require('../src/utils/signer-file-lock');
+async function withSignerContext(pool, operation) {
+  const ownedDir = !pool.processLockFile && !pool.pendingTxFile
+    ? fsSync.mkdtempSync(path.join(os.tmpdir(), 'keeper-unit-lock-')) : null;
+  const previousPath = pool.processLockFile;
+  pool.processLockFile ||= path.join(ownedDir || path.dirname(pool.pendingTxFile), 'signer.lock');
+  const lock = await acquireSignerFileLock(pool.processLockFile);
+  try { return await lock.run(operation); }
+  finally {
+    lock.release();
+    if (ownedDir) { fsSync.rmSync(ownedDir, { recursive: true, force: true }); pool.processLockFile = previousPath; }
+  }
+}
 
 function configureSignerState(pool, { dir, wallet, poolName = 'POOL' }) {
   pool.stateDir = dir;
@@ -332,7 +346,7 @@ test('signed broadcast reconciles a consumed nonce through the next RPC', async 
   pool._authenticatedProviderEntries = async () => entries;
 
   assert.equal(
-    await pool._broadcastSignedTransaction('0x1234', '0xabcd', 'rebalance', 0, 1),
+    await withSignerContext(pool, () => pool._broadcastSignedTransaction('0x1234', '0xabcd', 'rebalance', 0, 1)),
     expectedReceipt
   );
   assert.equal(unhealthyMarks, 0, 'a consumed nonce is not an RPC health failure');
@@ -389,14 +403,14 @@ test('pending transaction can be replaced with the same nonce and a bounded fee 
     to: '0x0000000000000000000000000000000000000001',
   });
   const txHash = ethers.keccak256(rawTx);
-  pool._persistSignedTx(rawTx, txHash, 'rebalance', 4);
+  await withSignerContext(pool, () => pool._persistSignedTx(rawTx, txHash, 'rebalance', 4));
   let replacementRaw;
   pool._broadcastSignedTransaction = async (raw) => {
     replacementRaw = raw;
     return { status: 1 };
   };
 
-  const result = await pool._replacePendingSignedTx(pool._readPendingSignedTx(), 1);
+  const result = await withSignerContext(pool, () => pool._replacePendingSignedTx(pool._readPendingSignedTx(), 1));
   const replacement = ethers.Transaction.from(replacementRaw);
   assert.equal(result.status, 'confirmed');
   assert.equal(replacement.nonce, 4);
@@ -427,10 +441,10 @@ test('persisted HF repair can be replaced above the normal fee cap', async (t) =
     data: '0x30cbb735',
   });
   const txHash = ethers.keccak256(rawTx);
-  pool._persistSignedTx(rawTx, txHash, 'hfRepair', 5, {
+  await withSignerContext(pool, () => pool._persistSignedTx(rawTx, txHash, 'hfRepair', 5, {
     feeCapExempt: true,
     feeCapExemptTarget: target,
-  });
+  }));
   let replacementRaw;
   pool._broadcastSignedTransaction = async (raw) => {
     replacementRaw = raw;
@@ -439,7 +453,7 @@ test('persisted HF repair can be replaced above the normal fee cap', async (t) =
 
   const persisted = pool._readPendingSignedTx();
   assert.equal(persisted.feeCapExempt, true);
-  const result = await pool._replacePendingSignedTx(persisted, 1);
+  const result = await withSignerContext(pool, () => pool._replacePendingSignedTx(persisted, 1));
   const replacement = ethers.Transaction.from(replacementRaw);
   assert.equal(result.status, 'confirmed');
   assert.equal(replacement.nonce, 5);
@@ -463,7 +477,6 @@ test('critical HF repair preempts an ordinary pending nonce above the normal fee
   pool.pendingTxFile = path.join(dir, 'pending.json');
   pool.getProvider = () => provider;
   pool._ensureSignerState = async () => {};
-  pool._withSignerLock = async (_provider, fn) => await fn();
   pool._authenticatedProviderEntries = async () => [{ provider }];
   pool._latestSignerNonce = async () => 6;
   pool.withTimeout = async (fn) => await fn();
@@ -478,7 +491,7 @@ test('critical HF repair preempts an ordinary pending nonce above the normal fee
     data: '0x12345678',
   });
   const ordinaryHash = ethers.keccak256(ordinaryRaw);
-  pool._persistSignedTx(ordinaryRaw, ordinaryHash, 'rebalance', 6);
+  await withSignerContext(pool, () => pool._persistSignedTx(ordinaryRaw, ordinaryHash, 'rebalance', 6));
 
   let replacementRaw;
   pool._broadcastSignedTransaction = async (raw) => {
@@ -597,7 +610,7 @@ test('signed transaction persistence is atomic and hash-bound across restarts', 
   });
   const txHash = ethers.keccak256(rawTx);
 
-  pool._persistSignedTx(rawTx, txHash, 'rebalance', 9);
+  await withSignerContext(pool, () => pool._persistSignedTx(rawTx, txHash, 'rebalance', 9));
   assert.deepEqual(pool._readPendingSignedTx(), {
     schemaVersion: 2,
     rawTx,
@@ -610,7 +623,7 @@ test('signed transaction persistence is atomic and hash-bound across restarts', 
     createdAt: pool._readPendingSignedTx().createdAt,
   });
   assert.equal(fsSync.statSync(pool.pendingTxFile).mode & 0o777, 0o600);
-  pool._clearPersistedSignedTx(txHash);
+  await withSignerContext(pool, () => pool._clearPersistedSignedTx(txHash));
   assert.equal(fsSync.existsSync(pool.pendingTxFile), false);
 });
 
@@ -696,7 +709,7 @@ test('a stale signer lock is reclaimed even when its PID has been reused', async
   const provider = { send: async () => '0xa4b1' };
   pool.providers = [{ provider, healthy: true, chainVerified: false, chainMismatch: false }];
   await pool._ensureSignerState(provider);
-  fsSync.writeFileSync(pool.processLockFile, `${JSON.stringify({ pid: process.pid, token: 'stale' })}\n`);
+  fsSync.writeFileSync(pool.processLockFile, `${JSON.stringify({ version: 2, pid: process.pid, processStartIdentity: 'ps:historical-process', token: 'stale' })}\n`, { mode: 0o600 });
   const staleAt = new Date(Date.now() - 3 * 60_000);
   fsSync.utimesSync(pool.processLockFile, staleAt, staleAt);
 
@@ -730,7 +743,7 @@ test('persisted transaction is cleared when its nonce was mined by a replacement
     to: '0x0000000000000000000000000000000000000001',
   });
   const txHash = ethers.keccak256(rawTx);
-  pool._persistSignedTx(rawTx, txHash, 'rebalance', 11);
+  await withSignerContext(pool, () => pool._persistSignedTx(rawTx, txHash, 'rebalance', 11));
 
   const recovered = await pool.reconcilePendingSignedTx();
   assert.equal(recovered.status, 'replaced');
