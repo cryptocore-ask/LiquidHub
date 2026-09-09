@@ -539,12 +539,10 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
 
     function _finalizeProcessedDeposit(
         PendingDeposit memory pd,
-        uint256 depositValue,
-        uint256 swapLossUsd,
+        uint256 creditedValue,
         uint256 currentTotalValue,
         uint256 totalSharesBefore
     ) private returns (uint256 sharesToMint) {
-        uint256 creditedValue = depositValue > swapLossUsd ? depositValue - swapLossUsd : 0;
         require(creditedValue > 0, "E_ZERO_VALUE");
 
         if (totalSharesBefore <= DEAD_SHARES) {
@@ -626,11 +624,9 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
 
         // 6. Swaps de reequilibrage bornes par l'oracle (anti-sandwich) + cap par chunk
         uint256 n = swapAmountsIn.length;
-        uint256 totalSwapLossUsd;
         if (n > 0) {
             for (uint256 i = 0; i < n; i++) {
-                uint256 amountOut = rangeManager.executeSwap(tokenIn, tokenOut, swapAmountsIn[i], minAmountsOut[i]);
-                totalSwapLossUsd += _swapLossUsd(tokenIn == address(token0), swapAmountsIn[i], amountOut);
+                rangeManager.executeSwap(tokenIn, tokenOut, swapAmountsIn[i], minAmountsOut[i]);
             }
             if (hasPosition) {
                 (uint256 fees0, uint256 fees1) = rangeManager.collectFeesForVault();
@@ -642,7 +638,12 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
         if (hasPosition) rangeManager.addLiquidityToPosition();
         else rangeManager.mintInitialPosition();
 
-        _finalizeProcessedDeposit(pd, depositValue, totalSwapLossUsd, valueBefore, sharesBefore);
+        // Use the same oracle NAV before and after placement: nominal token value can differ
+        // from the LP value minted at spot, even inside the oracle/TWAP admission bounds.
+        // Historic balances and the net fees crystallized above remain in valueBefore.
+        uint256 valueAfter = getCurrentPortfolioValue();
+        uint256 creditedValue = valueAfter > valueBefore ? valueAfter - valueBefore : 0;
+        _finalizeProcessedDeposit(pd, creditedValue, valueBefore, sharesBefore);
 
         // 8. DEVERROU
         _processingRebalance = false;
@@ -859,23 +860,6 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
         } catch {
             return 0;
         }
-    }
-
-    function _swapLossUsd(bool tokenInIsToken0, uint256 amountIn, uint256 amountOut) private view returns (uint256) {
-        (uint128 price0, uint128 price1,,,, bool valid) = rangeManager.priceCache();
-        require(valid, "E38");
-        RangeOperations.RangeConfig memory config = rangeManager.config();
-
-        uint256 valueIn;
-        uint256 valueOut;
-        if (tokenInIsToken0) {
-            valueIn = (amountIn * uint256(price0)) / (10 ** config.token0Decimals);
-            valueOut = (amountOut * uint256(price1)) / (10 ** config.token1Decimals);
-        } else {
-            valueIn = (amountIn * uint256(price1)) / (10 ** config.token1Decimals);
-            valueOut = (amountOut * uint256(price0)) / (10 ** config.token0Decimals);
-        }
-        return valueIn > valueOut ? valueIn - valueOut : 0;
     }
 
     // ===== VIEW FONCTIONS =====
