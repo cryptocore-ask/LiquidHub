@@ -94,7 +94,7 @@ function strategyLabel(labels, value, fallback) {
 }
 
 async function readStrategyState(rpcPool, rangeManager, strategyEngine) {
-  return await rpcPool.executeWithRetry(async (provider) => {
+  return await rpcPool.executeConsensusRead(async (provider) => {
     const rm = rangeManager.connect(provider);
     const engine = strategyEngine.connect(provider);
     const [positions, decision, checkpointDue] = await Promise.all([
@@ -103,7 +103,15 @@ async function readStrategyState(rpcPool, rangeManager, strategyEngine) {
       engine.checkpointDue(),
     ]);
     return { positions, decision, checkpointDue };
-  });
+  }, ({ positions, decision, checkpointDue }) => [
+    positions.map(String).join(','),
+    ...[
+      'epoch', 'validUntil', 'action', 'reason', 'currentTick', 'currentTickLower', 'currentTickUpper',
+      'targetTickLower', 'targetTickUpper', 'currentScoreBps', 'targetScoreBps', 'edgeBps',
+      'thresholdBps', 'uncertaintyBps', 'learningInfluenceBps', 'inRange', 'dataFresh', 'decisionHash',
+    ].map((field) => String(decision[field])),
+    String(checkpointDue),
+  ].join(':'), 'strategy state');
 }
 
 async function reconcileSignerState(rpcPool, actionAlerts) {
@@ -312,17 +320,18 @@ async function main() {
       // Convert a queued deposit into LP liquidity. The contract is atomic and self-protecting:
       // it refreshes the oracle, computes shares on the oracle, bounds swaps by the oracle (anti-MEV),
       // sets the rebalance lock (a concurrent withdraw reverts E32), and pays the deposit bounty.
-      // It REVERTS if the queue is empty, no position NFT exists (initial mint is the protocol bot's
-      // job), or the cache is stale — so we just try when a deposit is pending and skip on revert.
+      // The first-ever mint remains the protocol bot's job. After that bootstrap, a community keeper
+      // can recreate a position removed by a full withdrawal through this same bounded path.
       if (!CHECK_ONLY && !inflowsPaused) {
         try {
-          const [pending, positions, isRebalancing] = await rpcPool.executeWithRetry(async (p) => {
+          const [pending, positions, isRebalancing, initialPositionEstablished] = await rpcPool.executeWithRetry(async (p) => {
             const v = vault.connect(p);
             const rm = rangeManager.connect(p);
             return await Promise.all([
               v.getPendingDepositsCount(),
               rm.getOwnerPositions(),
               v.isRebalancing(),
+              v.initialPositionEstablished(),
             ]);
           });
           if (pending === 0n) {
@@ -333,15 +342,22 @@ async function main() {
               'mint',
               positions.length > 0 ? 'Initial position is available' : 'No queued deposit requires an initial mint'
             );
-          } else if (positions.length === 0) {
+          } else if (positions.length === 0 && !initialPositionEstablished) {
             const message = `${pending} queued deposit(s) waiting for the main bot initial mint`;
             console.log(`  Deposit deferred: ${message}`);
             await trackAction(actionAlerts, 'failure', 'mint', message);
           } else if (strategyAction === STRATEGY_ACTION.RANGE_REBALANCE) {
-            await trackAction(actionAlerts, 'success', 'mint', 'Initial position is available');
+            await trackAction(actionAlerts, 'success', 'mint', positions.length > 0
+              ? 'Initial position is available'
+              : 'Community restart is authorized after the prior position');
             console.log(`  Deposit deferred: ${actionLabel} is eligible (${reasonLabel})`);
           } else if (!isRebalancing) {
-            await trackAction(actionAlerts, 'success', 'mint', 'Initial position is available');
+            await trackAction(
+              actionAlerts,
+              'success',
+              'mint',
+              positions.length > 0 ? 'Initial position is available' : 'Community position restart is authorized'
+            );
             await checkBountyFunding('deposit', 'deposit', treasury, treasuryAddr, usdc, rpcPool);
             console.log(`  -> ${pending.toString()} deposit(s) pending, processing one on-chain...`);
             const result = await rebalancer.processDeposit();
@@ -359,7 +375,7 @@ async function main() {
       }
 
       // Public keepers execute only the action authorized by the canonical on-chain enum.
-      // Initial mint remains the sole protocol-bot-only operational path.
+      // Only the one-time deployment bootstrap remains protocol-bot-only.
       if (strategyAction !== STRATEGY_ACTION.RANGE_REBALANCE) {
         console.log('  -> No rebalance needed\n');
         await trackAction(actionAlerts, 'success', 'rebalance', 'Rebalance completed elsewhere or no longer required');

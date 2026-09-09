@@ -81,6 +81,10 @@ contract AaveHedgeManager is ReentrancyGuard {
     // Seule la branche de reparation HF sous hfRepairTriggerBps le contourne, avant ce garde-fou.
     uint32 public hedgeAdjustCooldown = 14400; // 4 h entre deux ajustements ordinaires ; les urgences contournent ce delai
     uint64 public lastHedgeAdjustAt; // timestamp du dernier reajustement (borrow ou repay)
+    // Vrai uniquement lorsqu'une correction critique d'inventaire a atteint le plafond USD par swap.
+    // Autorise les appels suivants du bot ou des keepers a finir cette meme correction, sans ouvrir
+    // une voie de contournement du cooldown pour un nouvel ajustement de dette.
+    bool public inventoryNormalizationPending;
     // audit V1 (V3-R4 Point 2) : ecart MAX tolere entre le prix LP (slot0 du pool) et le ratio ORACLE
     // token0/token1 du RangeManager AVANT de calculer token0InLP dans adjustHedge().
     // adjustHedge() est permissionless : sans cette garde, un prix LP manipule (slot0) gonfle/reduit
@@ -707,10 +711,16 @@ contract AaveHedgeManager is ReentrancyGuard {
         //    int256 OBLIGATOIRE : si idle > dette (ex. donation), effectiveShort < 0 => sous-hedge AGGRAVE.
         //    Anti-grief donation : on ne compte que la PART AU-DELA du seuil dust (pas tout-ou-rien), et on
         //    filtre AUSSI le token0 du HedgeManager (sinon une donation au HM force un sous-hedge artificiel = DoS).
-        (uint256 currentDebtWeth, int256 effectiveShort, bool inventoryRemaining, uint256 normalized0) =
-            RangeStrategyDnLib.prepareHedgeInventory(targetShort, enforceThresholds);
+        (
+            uint256 currentDebtWeth,
+            int256 effectiveShort,
+            bool inventoryOnly,
+            uint256 normalized0
+        ) = RangeStrategyDnLib.prepareHedgeInventory(targetShort, enforceThresholds, inventoryNormalizationPending);
+        inventoryNormalizationPending = inventoryOnly && targetShort != 0 && effectiveShort < int256(targetShort)
+            && int256(currentDebtWeth) > effectiveShort;
         bool borrowed = effectiveShort < int256(targetShort);
-        uint256 diff = inventoryRemaining
+        uint256 diff = inventoryOnly
             ? 0
             : borrowed ? uint256(int256(targetShort) - effectiveShort) : uint256(effectiveShort - int256(targetShort));
         bool bountyEligible =
@@ -732,14 +742,14 @@ contract AaveHedgeManager is ReentrancyGuard {
         }
 
         // Do not strand the remainder of a capped inventory correction behind a new cooldown.
-        if (!inventoryRemaining) lastHedgeAdjustAt = uint64(block.timestamp);
+        if (!inventoryOnly) lastHedgeAdjustAt = uint64(block.timestamp);
 
         _rebuildReserve();
 
         _requireHfMin();
 
         // Bounty silent, uniquement apres correction et post-checks complets.
-        if (payBounty && !inventoryRemaining && diff > 0 && bountyEligible && treasuryAddress != address(0)) {
+        if (payBounty && !inventoryOnly && diff > 0 && bountyEligible && treasuryAddress != address(0)) {
             try IHedgeTreasury(treasuryAddress).payHedgeBounty(keeper) {} catch {}
         }
 

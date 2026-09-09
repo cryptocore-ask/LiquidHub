@@ -276,6 +276,7 @@ contract RangeStrategyEngine is Ownable, ReentrancyGuard, IRangeStrategyEngine {
                 || cfg.maxLearningInfluenceBps == 0 || cfg.maxLearningInfluenceBps > 5000 || cfg.learningInfluenceBps == 0
                 || cfg.learningInfluenceBps > cfg.maxLearningInfluenceBps || cfg.maxCenterMoveBps > 10_000
                 || cfg.maxWidthChangeBps > 10_000 || cfg.transitionCostBps > 1000 || cfg.dnMinStressHfBps != 0
+                || !_hasAlignedHalfWidth(cfg.minHalfRangeTicks, cfg.maxHalfRangeTicks)
         ) revert InvalidConfiguration();
     }
 
@@ -600,19 +601,22 @@ contract RangeStrategyEngine is Ownable, ReentrancyGuard, IRangeStrategyEngine {
 
         uint16[3] memory widthFactors = [uint16(7500), 10_000, 12_500];
         int16[3] memory skewFactors = [int16(-5000), 0, 5000];
+        uint256 spacing = uint256(uint24(_strategyTickSpacing));
         for (uint256 w; w < 3; ++w) {
             uint256 width = _clamp(
                 (uint256(analyticalWidth) * widthFactors[w]) / BPS,
                 strategyConfig.minHalfRangeTicks,
                 strategyConfig.maxHalfRangeTicks
             );
+            uint256 alignedWidth = width / spacing * spacing;
+            if (alignedWidth < strategyConfig.minHalfRangeTicks) alignedWidth += spacing;
             for (uint256 s; s < 3; ++s) {
                 if (decisionMode == DecisionMode.ANALYTIC_ONLY && (w != 1 || s != 1)) continue;
                 summary.candidateCount++;
                 int256 skew = int256(width) * int256(skewFactors[s]) * int256(uint256(strategyConfig.maxSkewBps))
                     / int256(BPS * BPS);
                 int24 center = _clampInt24(int256(anchor) + skew);
-                (int24 lower, int24 upper) = _alignedRange(center, int24(uint24(width)), int24(uint24(width)));
+                (int24 lower, int24 upper) = _alignedCandidateRange(center, uint16(alignedWidth));
                 Candidate memory candidate = _evaluateCandidate(
                     lower, upper, referenceTick, liveTick, anchor, analyticalWidth, position, position.inRange
                 );
@@ -943,7 +947,7 @@ contract RangeStrategyEngine is Ownable, ReentrancyGuard, IRangeStrategyEngine {
         uint256 minimum = uint256(uint24(_strategyTickSpacing)) * 5;
         if (
             minHalf < minimum || maxHalf <= minHalf || maxHalf > 5000 || fallbackUp < minHalf || fallbackUp > maxHalf
-                || fallbackDown < minHalf || fallbackDown > maxHalf
+                || fallbackDown < minHalf || fallbackDown > maxHalf || !_hasAlignedHalfWidth(minHalf, maxHalf)
         ) revert InvalidConfiguration();
         strategyConfig.fallbackRangeUpTicks = fallbackUp;
         strategyConfig.fallbackRangeDownTicks = fallbackDown;
@@ -957,6 +961,22 @@ contract RangeStrategyEngine is Ownable, ReentrancyGuard, IRangeStrategyEngine {
         upper = _ceilToSpacing(_boundedTick(int256(center) + up));
         if (lower <= MIN_TICK) lower = _ceilToSpacing(MIN_TICK + _strategyTickSpacing);
         if (upper >= MAX_TICK) upper = _floorToSpacing(MAX_TICK - _strategyTickSpacing);
+    }
+
+    function _hasAlignedHalfWidth(uint16 minHalf, uint16 maxHalf) private view returns (bool) {
+        uint256 spacing = uint256(uint24(_strategyTickSpacing));
+        uint256 alignedMin = (uint256(minHalf) + spacing - 1) / spacing * spacing;
+        uint256 alignedMax = uint256(maxHalf) / spacing * spacing;
+        return alignedMin <= alignedMax;
+    }
+
+    function _alignedCandidateRange(int24 center, uint16 half)
+        private
+        view
+        returns (int24 lower, int24 upper)
+    {
+        int24 alignedCenter = _floorToSpacing(center);
+        return _alignedRange(alignedCenter, int24(uint24(half)), int24(uint24(half)));
     }
 
     function _floorToSpacing(int24 tick) private view returns (int24) {

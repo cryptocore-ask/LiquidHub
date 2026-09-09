@@ -94,7 +94,11 @@ library RangeStrategyDnLib {
     event HedgeInventoryNormalized(uint256 amount0, uint256 amount1, bool complete);
     event RepayDebt(uint256 wethRepaid);
 
-    function _aaveBorrowRateRay(address hedgeManager, address token0) private view returns (bool available, uint256 rateRay) {
+    function _aaveBorrowRateRay(address hedgeManager, address token0)
+        private
+        view
+        returns (bool available, uint256 rateRay)
+    {
         (bool poolOk, bytes memory poolData) = hedgeManager.staticcall(abi.encodeWithSignature("pool()"));
         if (!poolOk || poolData.length < 32) return (false, 0);
         address aavePool = abi.decode(poolData, (address));
@@ -110,9 +114,9 @@ library RangeStrategyDnLib {
     /// @dev Delegatecall from the existing hedge path. Admission uses the PRE-swap drift.
     ///      Consume free inventory before borrowing, preserve each dust floor and use the RM's
     ///      existing per-swap USD ceiling. A capped correction may continue at a later checkpoint.
-    function prepareHedgeInventory(uint256 target, bool enforceThresholds)
+    function prepareHedgeInventory(uint256 target, bool enforceThresholds, bool allowInventoryContinuation)
         external
-        returns (uint256 debt, int256 effectiveShort, bool inventoryRemaining, uint256 normalized0)
+        returns (uint256 debt, int256 effectiveShort, bool inventoryOnly, uint256 normalized0)
     {
         IDnNegativeHedgeContext context = IDnNegativeHedgeContext(address(this));
         address token0 = context.weth();
@@ -124,19 +128,34 @@ library RangeStrategyDnLib {
         // against an all-stable LP or repay the whole hedge merely because its target is zero.
         if (target == 0 && !enforceThresholds) revert HedgeCheck(44);
         bool inventoryRepay = target == 0 && effectiveShort >= 0;
-        uint256 difference = inventoryRepay ? debt : effectiveShort < int256(target)
-            ? uint256(int256(target) - effectiveShort)
-            : uint256(effectiveShort - int256(target));
+        uint256 difference = inventoryRepay
+            ? debt
+            : effectiveShort < int256(target)
+                ? uint256(int256(target) - effectiveShort)
+                : uint256(effectiveShort - int256(target));
+        bool pendingInventoryOnly = allowInventoryContinuation && effectiveShort < int256(target)
+            && int256(debt) > effectiveShort;
         if (enforceThresholds) {
             IDnAaveStrategyState hedge = IDnAaveStrategyState(address(this));
             uint256 drift = target == 0 ? type(uint256).max : difference * BPS / target;
+            if (drift < hedge.adjustHedgeBps()) {
+                if (!pendingInventoryOnly) revert HedgeCheck(44);
+                inventoryOnly = true;
+            }
             if (
                 block.timestamp < uint256(hedge.lastHedgeAdjustAt()) + hedge.hedgeAdjustCooldown()
                     && drift < hedge.criticalHedgeBps()
-            ) revert HedgeCheck(41);
-            if (drift < hedge.adjustHedgeBps()) revert HedgeCheck(44);
+            ) {
+                // A previous critical leg may have consumed only one capped chunk of free token0.
+                // During the inherited cooldown, continue only that recorded inventory conversion.
+                // The caller receives inventoryOnly=true and therefore cannot borrow in this call.
+                if (!pendingInventoryOnly) revert HedgeCheck(41);
+                inventoryOnly = true;
+            }
         }
-        if (!inventoryRepay && effectiveShort >= int256(target)) return (debt, effectiveShort, false, 0);
+        if (!inventoryRepay && effectiveShort >= int256(target)) {
+            return (debt, effectiveShort, false, 0);
+        }
         uint256 idle = inventoryRepay ? idleHm : uint256(int256(debt) - effectiveShort);
         if (idle == 0) {
             if (inventoryRepay) revert HedgeCheck(44);
@@ -151,7 +170,7 @@ library RangeStrategyDnLib {
         if (amount0 == 0) revert InvalidNegativeHedgeSwap();
         // A zero-target inventory step is followed by a range decision, with no new
         // borrowing, bounty or cooldown even when the net long has been eliminated.
-        inventoryRemaining = target == 0 || amount0 < _min(difference, idle);
+        inventoryOnly = target == 0 || inventoryOnly || amount0 < _min(difference, idle);
         if (inventoryRepay) {
             // A capped repayment from HM inventory removes matching assets and debt:
             // no swap, no new delta, no extra debt. It makes a large residual inventory
@@ -200,7 +219,7 @@ library RangeStrategyDnLib {
         (debt, effectiveShort,) = _effectiveShort(context.variableDebtWeth(), token0, rangeManager, dustFloor);
         if (effectiveShort != beforeShort + int256(amount0)) revert InvalidNegativeHedgeSwap();
         normalized0 = amount0;
-        emit HedgeInventoryNormalized(amount0, amount1, !inventoryRemaining);
+        emit HedgeInventoryNormalized(amount0, amount1, amount0 == _min(difference, idle));
     }
 
     function _inventoryCap(address rm, uint128 price0, uint8 decimals0) private view returns (uint256) {
@@ -347,11 +366,11 @@ library RangeStrategyDnLib {
         bool coalesceHedge;
     }
 
-    function loadContext(
-        address hedgeManager,
-        address rangeManager,
-        address token0
-    ) external view returns (Context memory context) {
+    function loadContext(address hedgeManager, address rangeManager, address token0)
+        external
+        view
+        returns (Context memory context)
+    {
         IDnAaveStrategyState hedge = IDnAaveStrategyState(hedgeManager);
         try hedge.getHedgeData() returns (uint256 collateral, uint256 debtBase, uint256 hf, uint256 available) {
             context.collateralBase = collateral;
@@ -486,19 +505,23 @@ library RangeStrategyDnLib {
 
         uint16[3] memory widthFactors = [uint16(7500), 10_000, 12_500];
         int16[5] memory skewFactors = [int16(-10_000), -5000, 0, 5000, 10_000];
+        uint256 unsignedSpacing = uint256(uint24(config.tickSpacing));
         for (uint256 w; w < widthFactors.length; ++w) {
             uint256 width = _clamp(
                 uint256(config.analyticalWidth) * widthFactors[w] / BPS,
                 config.minHalfRangeTicks,
                 config.maxHalfRangeTicks
             );
+            uint256 alignedWidth = width / unsignedSpacing * unsignedSpacing;
+            if (alignedWidth < config.minHalfRangeTicks) alignedWidth += unsignedSpacing;
             for (uint256 s; s < skewFactors.length; ++s) {
                 if (config.analyticOnly && (w != 1 || skewFactors[s] != 0)) continue;
                 result.candidateCount++;
                 int256 skew =
                     int256(width) * int256(skewFactors[s]) * int256(uint256(config.maxSkewBps)) / int256(BPS * BPS);
                 int24 center = _clampInt24(int256(config.analyticalAnchor) + skew);
-                (int24 lower, int24 upper) = _alignedRange(center, uint16(width), config.tickSpacing);
+                (int24 lower, int24 upper) =
+                    _alignedCandidateRange(center, uint16(alignedWidth), config.tickSpacing);
                 Candidate memory candidate =
                     _evaluateCandidate(context, position, risk, config, lower, upper, position.inRange);
                 if (candidate.admissible) {
@@ -509,7 +532,7 @@ library RangeStrategyDnLib {
             }
 
             (int24 recoveryLower, int24 recoveryUpper, bool recoveryFound) =
-                _hedgeAlignedRange(context, position, uint16(width), config);
+                _hedgeAlignedRange(context, position, uint16(width), uint16(alignedWidth), config);
             if (recoveryFound) {
                 result.candidateCount++;
                 Candidate memory recovery =
@@ -559,6 +582,10 @@ library RangeStrategyDnLib {
             return candidate;
         }
 
+        (bool dnAdmissible, uint256 dnPenalty, uint256 hedgeDriftBps) =
+            _candidatePenalty(context, position, risk, lower, upper, config.liveTick);
+        if (!dnAdmissible) return candidate;
+
         uint24 volatility = config.forecastVolatilityTicks > 10 ? config.forecastVolatilityTicks : 10;
         (int32 scenarioScore, int32 expectedFees, int32 scenarioRisk) = RangeOperations.evaluateStrategyScenarios(
             RangeOperations.StrategyScenarioInput({
@@ -579,9 +606,6 @@ library RangeStrategyDnLib {
             : 0;
         score -= int256(transition);
 
-        (bool dnAdmissible, uint256 dnPenalty, uint256 hedgeDriftBps) =
-            _candidatePenalty(context, position, risk, lower, upper, config.liveTick);
-        if (!dnAdmissible) return candidate;
         score -= int256(dnPenalty);
         candidate.scoreBps = _clampInt32(score);
         candidate.feesBps = expectedFees;
@@ -621,6 +645,7 @@ library RangeStrategyDnLib {
         Context memory context,
         Position memory position,
         uint16 width,
+        uint16 alignedWidth,
         SearchConfig memory config
     ) private pure returns (int24 bestLower, int24 bestUpper, bool found) {
         if (
@@ -651,7 +676,8 @@ library RangeStrategyDnLib {
 
         for (uint256 iteration; iteration < 12 && low <= high; ++iteration) {
             int256 middle = (low + high) / 2;
-            (int24 lower, int24 upper) = _alignedRange(_clampInt24(middle), width, config.tickSpacing);
+            (int24 lower, int24 upper) =
+                _alignedCandidateRange(_clampInt24(middle), alignedWidth, config.tickSpacing);
             uint256 target;
             if (
                 config.liveTick > lower && config.liveTick < upper
@@ -678,7 +704,8 @@ library RangeStrategyDnLib {
             int256 center = endpoint == 0 ? low : high;
             if (center < minimumSearchCenter) center = minimumSearchCenter;
             if (center > maximumSearchCenter) center = maximumSearchCenter;
-            (int24 lower, int24 upper) = _alignedRange(_clampInt24(center), width, config.tickSpacing);
+            (int24 lower, int24 upper) =
+                _alignedCandidateRange(_clampInt24(center), alignedWidth, config.tickSpacing);
             if (config.liveTick <= lower || config.liveTick >= upper) continue;
             if (!_rangeSkewWithinBounds(lower, upper, config.liveTick, config.tickSpacing, config.maxSkewBps)) continue;
             if (position.inRange && !_movementWithinBounds(position, config, lower, upper)) continue;
@@ -1058,7 +1085,8 @@ library RangeStrategyDnLib {
     ) private pure returns (Projection memory projected) {
         if (!context.configured || (targetShort == 0 && (!allowInventoryStep || effectiveShort >= 0))) return projected;
         uint256 difference = int256(targetShort) >= effectiveShort
-            ? uint256(int256(targetShort) - effectiveShort) : uint256(effectiveShort - int256(targetShort));
+            ? uint256(int256(targetShort) - effectiveShort)
+            : uint256(effectiveShort - int256(targetShort));
         projected.hedgeDriftBps = targetShort == 0 ? type(uint256).max : difference * BPS / targetShort;
         uint256 units = 10 ** context.token0Decimals;
         uint256 idleStableBase = context.idleStableBase;
@@ -1072,7 +1100,8 @@ library RangeStrategyDnLib {
             idleStableBase += amount0 * uint256(context.price0) / units * (BPS - context.swapSlippageBps) / BPS;
         }
         uint256 targetBase = targetShort * uint256(context.price0) / units;
-        uint256 currentEffectiveBase = effectiveShort > 0 ? uint256(effectiveShort) * uint256(context.price0) / units : 0;
+        uint256 currentEffectiveBase =
+            effectiveShort > 0 ? uint256(effectiveShort) * uint256(context.price0) / units : 0;
         uint256 stableAssetsBase = context.collateralBase + idleStableBase;
         if (inventoryRemaining) {
             projected.debtBase = context.debtBase;
@@ -1118,11 +1147,13 @@ library RangeStrategyDnLib {
         projected.admissible = true;
     }
 
-    function _alignedRange(int24 center, uint16 width, int24 spacing) private pure returns (int24 lower, int24 upper) {
-        lower = _floorToSpacing(_boundedTick(int256(center) - int256(uint256(width))), spacing);
-        upper = _ceilToSpacing(_boundedTick(int256(center) + int256(uint256(width))), spacing);
-        if (lower <= MIN_TICK) lower = _ceilToSpacing(MIN_TICK + spacing, spacing);
-        if (upper >= MAX_TICK) upper = _floorToSpacing(MAX_TICK - spacing, spacing);
+    function _alignedCandidateRange(int24 center, uint16 half, int24 spacing)
+        private
+        pure
+        returns (int24 lower, int24 upper)
+    {
+        int24 alignedCenter = _floorToSpacing(center, spacing);
+        return _alignedAsymmetricRange(alignedCenter, uint16(half), uint16(half), spacing);
     }
 
     function _alignedAsymmetricRange(int24 center, uint16 down, uint16 up, int24 spacing)

@@ -12,6 +12,15 @@ const { Rebalancer, calculateChunkPlan, divideIntoChunks } = require('../src/reb
 const { PersistentActionAlerts } = require('../src/utils/action-alerts');
 const { RPCPool } = require('../src/utils/rpc');
 
+const TEST_BLOCK_HASH = `0x${'ab'.repeat(32)}`;
+const confirmedReceipt = (hash, blockNumber = 123) => ({
+  status: 1,
+  hash,
+  transactionHash: hash,
+  blockHash: TEST_BLOCK_HASH,
+  blockNumber,
+});
+
 // Keep the production RPC retry and progressive orchestration together: replacing
 // executeWithRetry with a one-argument stub used to hide an incompatible call.
 function progressiveFixture(overrides = {}) {
@@ -231,6 +240,7 @@ test('signed nonce and broadcast paths never consult a rejected wrong-chain endp
   pool.withTimeout = async (fn) => await fn();
   let wrongChainCalls = 0;
   let correctBroadcasts = 0;
+  let broadcasted = false;
   const wrong = {
     getTransactionCount: async () => { wrongChainCalls += 1; return 999; },
     getTransactionReceipt: async () => { wrongChainCalls += 1; return null; },
@@ -238,9 +248,8 @@ test('signed nonce and broadcast paths never consult a rejected wrong-chain endp
   };
   const correct = {
     getTransactionCount: async () => 7,
-    getTransactionReceipt: async () => null,
-    broadcastTransaction: async () => { correctBroadcasts += 1; },
-    waitForTransaction: async (hash) => ({ status: 1, hash }),
+    getTransactionReceipt: async (hash) => broadcasted ? confirmedReceipt(hash) : null,
+    broadcastTransaction: async () => { correctBroadcasts += 1; broadcasted = true; },
   };
   pool.providers = [
     { provider: wrong, healthy: false, errorCount: 0, chainVerified: false, chainMismatch: true },
@@ -316,17 +325,71 @@ test('nonce reconciliation uses one surviving RPC but rejects live disagreement'
   assert.equal(await pool._latestSignerNonce(), null);
 });
 
+test('signing nonce keeps one-RPC liveness but rejects two live disagreements', async () => {
+  const pool = Object.create(RPCPool.prototype);
+  pool.signerAddress = '0x0000000000000000000000000000000000000011';
+  pool.withTimeout = async (fn) => await fn();
+  pool.providers = [{}, {}];
+  let entries = [
+    { provider: { getTransactionCount: async () => 7 } },
+    { provider: { getTransactionCount: async () => { throw new Error('offline'); } } },
+  ];
+  pool._authenticatedProviderEntries = async () => entries;
+  assert.equal(await pool._signingNonce(), 7);
+
+  entries = [7, 8].map((nonce) => ({ provider: { getTransactionCount: async () => nonce } }));
+  await assert.rejects(() => pool._signingNonce(), { code: 'RPC_SIGNING_NONCE_QUORUM_UNAVAILABLE' });
+});
+
+test('critical reads and receipts keep one-RPC liveness but reject live disagreement', async () => {
+  const pool = Object.create(RPCPool.prototype);
+  pool.withTimeout = async (fn) => await fn();
+  pool.providers = [{}, {}];
+  let entries = [
+    { provider: { read: async () => 'canonical' } },
+    { provider: { read: async () => { throw new Error('offline'); } } },
+  ];
+  pool._authenticatedProviderEntries = async () => entries;
+  assert.equal(await pool.executeConsensusRead((provider) => provider.read(), String, 'test read'), 'canonical');
+
+  entries = ['canonical', 'forked'].map((value) => ({ provider: { read: async () => value } }));
+  await assert.rejects(
+    () => pool.executeConsensusRead((provider) => provider.read(), String, 'test read'),
+    { code: 'RPC_READ_QUORUM_UNAVAILABLE' }
+  );
+
+  const txHash = '0xabcd';
+  const survivingReceipt = confirmedReceipt(txHash);
+  entries = [
+    { provider: { getTransactionReceipt: async () => survivingReceipt } },
+    { provider: { getTransactionReceipt: async () => { throw new Error('offline'); } } },
+  ];
+  assert.deepEqual(await pool._readReceiptQuorum(entries, txHash, 'test receipt'), survivingReceipt);
+
+  const conflictingBlockHash = `0x${'cd'.repeat(32)}`;
+  entries[1] = {
+    provider: {
+      getTransactionReceipt: async () => ({ ...confirmedReceipt(txHash), blockHash: conflictingBlockHash }),
+    },
+  };
+  assert.equal(await pool._readReceiptQuorum(entries, txHash, 'test receipt'), null);
+});
+
 test('signed broadcast reconciles a consumed nonce through the next RPC', async () => {
   const pool = Object.create(RPCPool.prototype);
   pool.withTimeout = async (fn) => await fn();
   let unhealthyMarks = 0;
   pool.markUnhealthy = () => { unhealthyMarks += 1; };
+  let broadcasted = false;
+  const expectedReceipt = confirmedReceipt('0xabcd');
   const first = {
-    getTransactionReceipt: async () => null,
-    broadcastTransaction: async () => { throw new Error('nonce too low'); },
+    getTransactionReceipt: async () => broadcasted ? expectedReceipt : null,
+    broadcastTransaction: async () => { broadcasted = true; throw new Error('nonce too low'); },
   };
-  const expectedReceipt = { status: 1, hash: '0xabcd' };
-  const second = { getTransactionReceipt: async () => expectedReceipt };
+  const second = {
+    getTransactionReceipt: async () => broadcasted ? expectedReceipt : null,
+    broadcastTransaction: async () => { broadcasted = true; },
+  };
   const entries = [first, second].map((provider) => ({ provider }));
   pool.providers = entries;
   pool._authenticatedProviderEntries = async () => entries;
@@ -389,7 +452,8 @@ test('signed transaction failover prepares and signs once, then rebroadcasts the
   const broadcasts = [];
   const first = {
     send: async () => '0xa4b1',
-    getTransactionReceipt: async () => null,
+    getTransactionCount: async () => 7,
+    getTransactionReceipt: async (hash) => broadcasts.length >= 2 ? confirmedReceipt(hash) : null,
     broadcastTransaction: async (rawTx) => {
       broadcasts.push(rawTx);
       const error = new Error('primary network unavailable');
@@ -399,9 +463,9 @@ test('signed transaction failover prepares and signs once, then rebroadcasts the
   };
   const second = {
     send: async () => '0xa4b1',
-    getTransactionReceipt: async () => null,
+    getTransactionCount: async () => 7,
+    getTransactionReceipt: async (hash) => broadcasts.length >= 2 ? confirmedReceipt(hash) : null,
     broadcastTransaction: async (rawTx) => { broadcasts.push(rawTx); },
-    waitForTransaction: async (hash) => ({ status: 1, hash }),
   };
   pool.providers = [first, second].map((provider) => ({ provider, healthy: true, errorCount: 0 }));
   pool.currentIndex = 0;

@@ -123,6 +123,7 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
     // (jamais revert ici ; les équivalents PreAdjustRequired/InsufficientCollateral vivent dans DnDepositLib).
     error E_DEPOSIT_TOO_LARGE(); // dépôt en tête > plafond compatible MAX_SWAP_CHUNKS → anti-DoS file
     error E_NOT_REFUNDABLE(); // remboursement dépôt en tête demandé avant expiration
+    error DepositNotQueueHead();
     error E_ZERO_SHARES(); // depot processe pour 0 share / 0 valeur (audit V1)
     error E_HEDGE_PAUSED(); // nouvelles entrees DN refusees tant que les ouvertures AAVE sont suspendues
     error WithdrawalValueTooLow();
@@ -238,6 +239,9 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
     // Age max (secondes) du cache prix accepte par processDepositPermissionless (anti-prix-perime).
     // Reglable par la Safe sans redeploiement. Defaut 300s, aligne bot/keepers.
     uint256 public depositMaxCacheAge = 300;
+    // False only for deployment bootstrap. A prior successful position permits a community keeper
+    // to recreate the DN position after a full withdrawal through the same atomic hedge/deposit path.
+    bool public initialPositionEstablished;
 
     // ===== REFONTE DN — dépôt permissionless hedgé (paramètres gouvernance) =====
     uint16 public dnPostCheckMaxDriftBps = 300; // plafond fixe ; DnDepositLib applique dynamiquement min(plafond, seuil critique range)
@@ -480,11 +484,12 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
         _refundStaleDeposit(_pendingHead);
     }
 
-    /// @notice Refund any matured request, including one displaced by a Safe recovery.
-    /// @dev Permissionless, O(1), and paid exclusively to the recorded depositor.
+    /// @notice Refund the matured request identified by its depositor once it reaches the queue head.
+    /// @dev Keeping this overload head-only preserves FIFO order while any caller can still unblock the head.
     function refundStaleDeposit(address depositor) external nonReentrant {
         uint256 indexPlusOne = _pendingIndexPlusOne[depositor];
         if (indexPlusOne == 0) revert E24();
+        if (indexPlusOne != _pendingHead + 1) revert DepositNotQueueHead();
         _refundStaleDeposit(indexPlusOne - 1);
     }
 
@@ -640,8 +645,8 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
      *      en liquidite LP, sans le bot du fondateur. En UNE tx : refresh oracle -> calcul shares
      *      (oracle) -> transfert fonds au RM -> swaps bornes oracle (anti-MEV) -> addLiquidity ->
      *      deposit bounty. Verrou _processingRebalance pose pendant toute la fonction (un withdraw
-     *      concurrent revert E32). En DN, le mint initial reste reserve au botModule/owner ; les keepers
-     *      permissionless ne peuvent traiter que les depots de croissance apres creation du NFT.
+     *      concurrent revert E32). En DN, le tout premier mint reste reserve au botModule/owner ; apres
+     *      bootstrap, les keepers peuvent aussi recreer atomiquement une position retiree integralement.
      */
     function processDepositPermissionless(
         uint256[] calldata swapAmountsIn,
@@ -655,10 +660,12 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
         if (swapAmountsIn.length > DN_MAX_SWAP_CHUNKS) revert E_DEPOSIT_TOO_LARGE();
         // 1. File non vide (anti-drain bounty)
         if (_pendingCount() == 0) revert E24();
-        // 2. Etat LP : si aucun NFT n'existe, seule l'execution botModule/owner peut minter la position
-        // initiale hedgee. Les keepers anonymes gardent le traitement permissionless des depots de croissance.
+        // 2. Etat LP : le premier mint hedgé reste botModule/owner. Après qu'une position a déjà existé,
+        // un keeper peut la recréer après un retrait intégral avec les contrôles DN complets ci-dessous.
         bool hasPosition = rangeManager.getOwnerPositions().length > 0;
-        if (!hasPosition && msg.sender != botModule && msg.sender != owner()) revert E03();
+        if (!hasPosition && !initialPositionEstablished && msg.sender != botModule && msg.sender != owner()) {
+            revert E03();
+        }
         // 3. Refresh oracle atomique avant toute valorisation du depot permissionless.
         rangeManager.refreshPriceCache();
         if (hasPosition) {
@@ -741,6 +748,7 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
         // 7. Ajouter a la position existante, ou minter la position initiale après hedge + swaps.
         if (hasPosition) rangeManager.addLiquidityToPosition();
         else rangeManager.mintInitialPosition();
+        initialPositionEstablished = true;
 
         // 7b. REFONTE DN : POST-CHECK strict. effectiveShort doit ≈ cible (tolérance dnPostCheckMaxDriftBps),
         // sinon REVERT toute la tx (le dépôt reste en file ; un rebalance/adjust approprié puis retente). + HF sain.

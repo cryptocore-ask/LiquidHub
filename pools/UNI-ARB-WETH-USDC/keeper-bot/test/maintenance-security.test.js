@@ -24,7 +24,11 @@ test('both supported decision modes retain topology admission and unknown modes 
       hedgeManager: address(6), pool: address(8), getAddress: address(7), profile: IS_DN ? 1 : 0, strategyVersion: IS_DN ? 3 : 2 };
     const contracts = Object.fromEntries(['rangeManager', 'vault', 'strategyEngine', 'secureBotModule', 'hedgeManager'].map(k => [k, connectable(values)]));
     contracts.strategyEngine.decisionMode = async () => mode;
-    const rpc = { executeWithRetry: async fn => fn({ getCode: async () => '0x6000' }) };
+    const provider = { getCode: async () => '0x6000' };
+    const rpc = {
+      executeWithRetry: async fn => fn(provider),
+      executeConsensusRead: async fn => fn(provider),
+    };
     for (mode of [0, 1]) await assert.doesNotReject(assertKeeperTopology(rpc, contracts));
     for (mode of [2, -1, 100]) await assert.rejects(assertKeeperTopology(rpc, contracts), /ANALYTIC_ONLY or HYBRID/);
     mode = 0; contracts.strategyEngine.strategyVersion = async () => 99;
@@ -67,8 +71,8 @@ test('a suspended live keeper cannot lose its nonce lock or overwrite another in
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'keeper-suspended-owner-'));
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
   const wallet = ethers.Wallet.createRandom();
-  const provider = {};
   let resumeA, enteredA, nextNonce = 7, preparedB = 0;
+  const provider = { getTransactionCount: async () => nextNonce };
   const atA = new Promise(resolve => { enteredA = resolve; });
   const gateA = new Promise(resolve => { resumeA = resolve; });
   const signed = [];

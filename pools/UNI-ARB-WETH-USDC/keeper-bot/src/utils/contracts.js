@@ -83,8 +83,10 @@ const VAULT_ABI = [
   // --- depot permissionless ---
   // processDepositPermissionless traite 1 depot de la file (atomique) : shares (oracle) -> swaps
   // bornes oracle -> addLiquidity -> deposit bounty. Verrou anti-withdraw concurrent. REVERT si file
-  // vide / pas de NFT / cache prix perime / minOut < plancher oracle. Appeler en try/catch.
+  // vide / bootstrap initial reserve au bot / cache prix perime / minOut < plancher oracle. Après le
+  // premier mint, un keeper peut recréer une position disparue à la suite d'un retrait intégral.
   "function getPendingDepositsCount() external view returns (uint256)",
+  "function initialPositionEstablished() external view returns (bool)",
   "function getNextDepositValueUSD() external view returns (uint256)",
   "function processDepositPermissionless(uint256[] swapAmountsIn, uint256[] minAmountsOut, address tokenIn, address tokenOut) external",
   // AUDIT H-01/H-03 : plan de swap du PROCHAIN dépôt (état post-transfert, ratio NFT existant). À utiliser
@@ -174,9 +176,17 @@ function sameAddress(actual, expected) {
 async function syncCurrentBotModule(rpcPool, rangeManager, currentModule, rebalancer = null) {
   // Governance rotates this link atomically with the executor grant. Follow it before
   // inspecting progressive state: a retired module can retain state 2 indefinitely.
-  const address = ethers.getAddress(await rpcPool.executeWithRetry(async (provider) => {
-    return rangeManager.connect(provider).protocolBotAddress();
-  }));
+  const address = ethers.getAddress(await rpcPool.executeConsensusRead(async (provider) => {
+    const discovered = ethers.getAddress(await rangeManager.connect(provider).protocolBotAddress());
+    if (discovered === ethers.ZeroAddress || await provider.getCode(discovered) === '0x') {
+      throw new Error('RangeManager has no active bot module');
+    }
+    const module = currentModule.attach(discovered).connect(provider);
+    if (!sameAddress(await module.rangeManager(), rangeManager.target)) {
+      throw new Error('Active bot module does not point back to RangeManager');
+    }
+    return discovered;
+  }, (value) => String(value).toLowerCase(), 'active bot module'));
   if (address === ethers.ZeroAddress) throw new Error('RangeManager has no active bot module');
   const module = sameAddress(await currentModule.getAddress(), address)
     ? currentModule
@@ -200,7 +210,7 @@ async function assertKeeperTopology(rpcPool, { rangeManager, vault, strategyEngi
     secureBotModule: await secureBotModule.getAddress(),
   };
 
-  const topology = await rpcPool.executeWithRetry(async (provider) => {
+  const topology = await rpcPool.executeConsensusRead(async (provider) => {
     const rm = rangeManager.connect(provider);
     const v = vault.connect(provider);
     const engine = strategyEngine.connect(provider);
@@ -232,7 +242,8 @@ async function assertKeeperTopology(rpcPool, { rangeManager, vault, strategyEngi
       rmCode, vaultCode, engineCode, moduleCode, rmVault, rmToken0, rmToken1, rmEngine, vaultRm, vaultToken0,
       vaultToken1, engineRm, enginePool, rmPool, moduleRm, moduleVault, moduleEngine, engineProfile, engineMode, engineVersion,
     };
-  });
+  }, (value) => JSON.stringify(value, (_key, item) => typeof item === 'bigint' ? item.toString() : item),
+  'keeper topology');
 
   if (topology.rmCode === '0x') throw new Error('Keeper topology: RangeManager has no runtime code');
   if (topology.vaultCode === '0x') throw new Error('Keeper topology: Vault has no runtime code');

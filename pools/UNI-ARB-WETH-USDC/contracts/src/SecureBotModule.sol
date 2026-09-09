@@ -62,6 +62,10 @@ interface IProgressiveStrategy {
 }
 
 contract SecureBotModule {
+    error ProgressiveDecisionMismatch();
+    error ProgressivePlanExpired();
+    error ProgressivePlanStale();
+
     address public immutable safe;
     address public immutable botAddress;
     address public immutable rangeManager;
@@ -86,6 +90,7 @@ contract SecureBotModule {
     int24 public progressiveTickUpper;
     bytes32 public progressiveDecisionHash;
     uint64 public progressivePlanEpoch;
+    uint64 private progressivePlanValidUntil;
     // All retargets share this remaining turnover cap; only Safe recovery can renew it.
     uint256 public progressiveCycleBudgetUsdE8;
     uint256 public progressiveSwapBudgetUsdE8;
@@ -232,11 +237,16 @@ contract SecureBotModule {
         progressiveRebalanceStatus = 1;
         IProgressiveVault(vault).syncFeesForDeposits();
         IRangeManagerBotState(rangeManager).refreshPriceCache();
+        IRangeStrategyEngine.Decision memory decision = IRangeStrategyEngine(strategyEngine).previewDecision();
+        if (decision.decisionHash != expectedDecisionHash) {
+            revert ProgressiveDecisionMismatch();
+        }
         (progressiveSwapBudgetUsdE8, progressiveReverseBudgetUsdE8, progressiveInitialZeroForOne) =
             _requireProgressivePlan();
         (int24 lower, int24 upper) =
             IProgressiveRangeManager(rangeManager).progressiveRebalance(0, expectedDecisionHash, 0, 0, 0, 0, msg.sender);
-        progressivePlanEpoch = IRangeStrategyEngine(strategyEngine).previewDecision().epoch;
+        progressivePlanEpoch = decision.epoch;
+        progressivePlanValidUntil = decision.validUntil;
         progressiveCycleBudgetUsdE8 = _progressiveAssetsUsd();
         progressiveTickLower = lower;
         progressiveTickUpper = upper;
@@ -317,6 +327,7 @@ contract SecureBotModule {
         progressiveTickUpper = decision.targetTickUpper;
         progressiveDecisionHash = expectedDecisionHash;
         progressivePlanEpoch = decision.epoch;
+        progressivePlanValidUntil = decision.validUntil;
         (progressiveSwapBudgetUsdE8, progressiveReverseBudgetUsdE8, progressiveInitialZeroForOne) =
             _progressivePlanBudget(_progressiveSwapParams());
         if (newCycle || safeRecovery) progressiveCycleBudgetUsdE8 = _progressiveAssetsUsd();
@@ -327,6 +338,7 @@ contract SecureBotModule {
     function continueProgressiveRebalance(uint256 amountIn, uint256 minAmountOut) external {
         _requireCurrentModule();
         require(progressiveRebalanceStatus == 2 && IProgressiveVault(vault).isRebalancing(), "No progressive");
+        _requireCurrentProgressivePlan();
         progressiveRebalanceStatus = 3;
         IRangeManagerBotState(rangeManager).refreshPriceCache();
         RangeOperations.OptimalSwapParams memory plan = _progressiveSwapParams();
@@ -358,6 +370,7 @@ contract SecureBotModule {
     function finalizeProgressiveRebalance(uint256 amountIn, uint256 minAmountOut) external {
         _requireCurrentModule();
         require(progressiveRebalanceStatus == 2 && IProgressiveVault(vault).isRebalancing(), "No progressive");
+        _requireCurrentProgressivePlan();
         progressiveRebalanceStatus = 3;
         if (amountIn > 0) {
             IRangeManagerBotState(rangeManager).refreshPriceCache();
@@ -375,6 +388,7 @@ contract SecureBotModule {
 
     function _clearProgressiveRebalance() private {
         delete progressivePlanEpoch;
+        delete progressivePlanValidUntil;
         delete progressiveCycleBudgetUsdE8;
         delete progressiveTickLower;
         delete progressiveTickUpper;
@@ -383,6 +397,13 @@ contract SecureBotModule {
         delete progressiveReverseBudgetUsdE8;
         delete progressiveInitialZeroForOne;
         progressiveRebalanceStatus = 0;
+    }
+
+    function _requireCurrentProgressivePlan() private view {
+        if (block.timestamp > progressivePlanValidUntil) revert ProgressivePlanExpired();
+        if (IRangeStrategyEngine(strategyEngine).previewDecision().epoch != progressivePlanEpoch) {
+            revert ProgressivePlanStale();
+        }
     }
 
     function _consumeProgressiveSwapBudget(bool zeroForOne, uint256 amountIn) private {

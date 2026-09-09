@@ -17,6 +17,7 @@ function fixture() {
   const moduleInterface = new ethers.Interface(SECURE_BOT_MODULE_ABI);
   const state = { activeModule: OLD, locked: true, error: null, calls: [], resumed: 0 };
   const provider = {
+    getCode: async () => '0x6000',
     call: async (request) => {
       const target = ethers.getAddress(request.to);
       if (target === RM) {
@@ -28,11 +29,17 @@ function fixture() {
       }
       const method = moduleInterface.parseTransaction(request).name;
       state.calls.push({ target, method });
+      if (method === 'rangeManager') {
+        return moduleInterface.encodeFunctionResult(method, [RM]);
+      }
       assert.equal(method, 'progressiveRebalanceStatus');
       return moduleInterface.encodeFunctionResult(method, [target === OLD ? 2 : 0]);
     },
   };
-  const rpcPool = { executeWithRetry: async (callback) => callback(provider) };
+  const rpcPool = {
+    executeWithRetry: async (callback) => callback(provider),
+    executeConsensusRead: async (callback) => callback(provider),
+  };
   const rangeManager = new ethers.Contract(RM, RANGEMANAGER_ABI, provider);
   const oldModule = new ethers.Contract(OLD, SECURE_BOT_MODULE_ABI, provider);
   const rebalancer = Object.create(Rebalancer.prototype);

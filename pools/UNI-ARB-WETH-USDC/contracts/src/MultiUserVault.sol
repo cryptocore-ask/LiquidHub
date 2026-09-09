@@ -69,6 +69,7 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
     using SafeERC20 for IERC20;
 
     error E49(); // token transfer amount differs from the queued accounting amount
+    error DepositNotQueueHead();
 
     error OnlyOperationalExecutor();
     error OnlyEmergencySafe();
@@ -187,6 +188,9 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
     // Reglable par la Safe sans redeploiement. Defaut 300s, aligne bot/keepers.
     uint256 public depositMaxCacheAge = 300;
     uint256 public depositRefundDelay = 6 hours;
+    // False only during the one-time deployment bootstrap. Once a position has been used successfully,
+    // community keepers may recreate it after a full withdrawal through the same bounded deposit path.
+    bool public initialPositionEstablished;
 
     // Systeme de tracking lazy des fees nettes par share
     // audit V1 (M3-B-fix, retour Codex) : COMPTA DES FEES — accFeePerShare pro-rata des SHARES courantes.
@@ -418,11 +422,12 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
         _refundStaleDeposit(_pendingHead);
     }
 
-    /// @notice Refund any matured request, including one displaced by a Safe recovery.
-    /// @dev Permissionless, O(1), and paid exclusively to the recorded depositor.
+    /// @notice Refund the matured request identified by its depositor once it reaches the queue head.
+    /// @dev Keeping this overload head-only preserves FIFO order while any caller can still unblock the head.
     function refundStaleDeposit(address depositor) external nonReentrant {
         uint256 indexPlusOne = _pendingIndexPlusOne[depositor];
         require(indexPlusOne != 0, "E24");
+        if (indexPlusOne != _pendingHead + 1) revert DepositNotQueueHead();
         _refundStaleDeposit(indexPlusOne - 1);
     }
 
@@ -598,11 +603,11 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
         require(!_processingRebalance, "E32");
         // 1. File non vide (anti-drain bounty : on ne paie que sur depot reel)
         require(_pendingCount() > 0, "E24");
-        // 2. Etat LP : si aucun NFT n'existe, seule l'execution botModule/owner peut minter la position initiale.
-        //    Les keepers anonymes gardent le traitement permissionless des depots de croissance apres creation du NFT.
+        // 2. Etat LP : le tout premier mint reste botModule/owner. Après qu'une position a déjà existé,
+        //    un keeper peut la recréer à la suite d'un retrait intégral, avec les mêmes contrôles oracle/swap.
         uint256[] memory positions = rangeManager.getOwnerPositions();
         bool hasPosition = positions.length > 0;
-        if (!hasPosition) {
+        if (!hasPosition && !initialPositionEstablished) {
             require(msg.sender == botModule || msg.sender == owner(), "E71");
         }
         // _processOneDeposit() refresh le cache juste avant le calcul NAV et le transfert. Il n'y a donc
@@ -634,9 +639,11 @@ contract MultiUserVault is Ownable, ReentrancyGuard {
             }
         }
 
-        // 7. Ajouter a la position existante, ou minter la position initiale en atomique bot-only.
+        // 7. Ajouter a la position existante, ou minter atomiquement. Le premier mint a deja ete
+        //    reserve au bot/owner ci-dessus ; un mint de reprise reste permissionless apres bootstrap.
         if (hasPosition) rangeManager.addLiquidityToPosition();
         else rangeManager.mintInitialPosition();
+        initialPositionEstablished = true;
 
         // Use the same oracle NAV before and after placement: nominal token value can differ
         // from the LP value minted at spot, even inside the oracle/TWAP admission bounds.

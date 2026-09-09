@@ -69,6 +69,22 @@ interface IProgressiveHedgeGuard {
 }
 
 contract SecureBotModule {
+    error InvalidCallData();
+    error InvalidPrice();
+    error InvalidProgressiveChunk();
+    error InvalidProgressiveRecovery();
+    error InvalidTarget();
+    error ModulePaused();
+    error ProgressiveActive();
+    error ProgressiveDecisionMismatch();
+    error ProgressiveEpochNotAdvanced();
+    error ProgressiveInactive();
+    error ProgressivePlanExpired();
+    error ProgressivePlanStale();
+    error ProgressivePositionExists();
+    error UnauthorizedOwner();
+    error VaultNotRebalancing();
+
     error CompoundHedgeChanged();
 
     address public immutable safe;
@@ -94,6 +110,7 @@ contract SecureBotModule {
     int24 public progressiveTickUpper;
     bytes32 public progressiveDecisionHash;
     uint64 public progressivePlanEpoch;
+    uint64 private progressivePlanValidUntil;
     // All retargets share this remaining turnover cap; only Safe recovery can renew it.
     uint256 public progressiveCycleBudgetUsdE8;
     uint256 public progressiveSwapBudgetUsdE8;
@@ -251,16 +268,21 @@ contract SecureBotModule {
     /// @notice Permissionless high-TVL path, independent from the hot-bot pause and fully bounded on-chain.
     function beginProgressiveRebalance(bytes32 expectedDecisionHash) external {
         _requireCurrentModule();
-        require(progressiveRebalanceStatus == 0, "Progressive active");
+        if (progressiveRebalanceStatus != 0) revert ProgressiveActive();
         _requireProgressiveHfSafe();
         progressiveRebalanceStatus = 1;
         IProgressiveVault(vault).syncFeesForDeposits();
         IRangeManagerPostCheck(rangeManager).refreshPriceCache();
+        IRangeStrategyEngine.Decision memory decision = IRangeStrategyEngine(strategyEngine).previewDecision();
+        if (decision.decisionHash != expectedDecisionHash) {
+            revert ProgressiveDecisionMismatch();
+        }
         (progressiveSwapBudgetUsdE8, progressiveReverseBudgetUsdE8, progressiveInitialZeroForOne) =
             _requireProgressivePlan();
         (int24 lower, int24 upper) =
             IProgressiveRangeManager(rangeManager).progressiveRebalance(0, expectedDecisionHash, 0, 0, 0, 0, msg.sender);
-        progressivePlanEpoch = IRangeStrategyEngine(strategyEngine).previewDecision().epoch;
+        progressivePlanEpoch = decision.epoch;
+        progressivePlanValidUntil = decision.validUntil;
         progressiveCycleBudgetUsdE8 = _progressiveAssetsUsd();
         progressiveTickLower = lower;
         progressiveTickUpper = upper;
@@ -284,7 +306,7 @@ contract SecureBotModule {
         IRangeManagerPostCheck rm = IRangeManagerPostCheck(rangeManager);
         (uint128 p0, uint128 p1, uint160 sqrtP, int24 tick, uint64 timestamp, bool valid) = rm.priceCache();
         cache = RangeOperations.PriceCache(p0, p1, sqrtP, tick, timestamp, valid);
-        require(cache.valid && cache.price0 > 0 && cache.price1 > 0, "Invalid price");
+        if (!cache.valid || cache.price0 == 0 || cache.price1 == 0) revert InvalidPrice();
     }
 
     function _progressivePlanBudget(RangeOperations.OptimalSwapParams memory plan)
@@ -323,26 +345,31 @@ contract SecureBotModule {
 
     function _refreshProgressiveRebalance(bytes32 expectedDecisionHash, bool safeRecovery) private {
         _requireCurrentModule();
-        require(progressiveRebalanceStatus == 0 || progressiveRebalanceStatus == 2, "Progressive active");
-        require(IProgressiveVault(vault).isRebalancing(), "Vault unlocked");
+        if (progressiveRebalanceStatus != 0 && progressiveRebalanceStatus != 2) revert ProgressiveActive();
+        if (!IProgressiveVault(vault).isRebalancing()) revert VaultNotRebalancing();
         _requireProgressiveHfSafe();
         bool newCycle = progressiveRebalanceStatus == 0;
         progressiveRebalanceStatus = 3;
         IRangeManagerPostCheck rm = IRangeManagerPostCheck(rangeManager);
-        require(rm.getOwnerPositions().length == 0, "Position exists");
+        if (rm.getOwnerPositions().length != 0) revert ProgressivePositionExists();
         rm.refreshPriceCache();
         IRangeStrategyEngine.Decision memory decision =
             IRangeStrategyEngine(strategyEngine).validateDecision(expectedDecisionHash);
-        require(decision.reason == IRangeStrategyEngine.ReasonCode.INITIAL_MINT_REQUIRED, "Invalid recovery");
-        require(newCycle || safeRecovery || decision.epoch > progressivePlanEpoch, "Plan epoch");
+        if (decision.reason != IRangeStrategyEngine.ReasonCode.INITIAL_MINT_REQUIRED) {
+            revert InvalidProgressiveRecovery();
+        }
+        if (!(newCycle || safeRecovery || decision.epoch > progressivePlanEpoch)) {
+            revert ProgressiveEpochNotAdvanced();
+        }
         RangeOperations.PriceCache memory cache = _progressiveCache();
-        require(
-            cache.poolTick > decision.targetTickLower && cache.poolTick < decision.targetTickUpper, "Invalid recovery"
-        );
+        if (cache.poolTick <= decision.targetTickLower || cache.poolTick >= decision.targetTickUpper) {
+            revert InvalidProgressiveRecovery();
+        }
         progressiveTickLower = decision.targetTickLower;
         progressiveTickUpper = decision.targetTickUpper;
         progressiveDecisionHash = expectedDecisionHash;
         progressivePlanEpoch = decision.epoch;
+        progressivePlanValidUntil = decision.validUntil;
         (progressiveSwapBudgetUsdE8, progressiveReverseBudgetUsdE8, progressiveInitialZeroForOne) =
             _progressivePlanBudget(_progressiveSwapParams());
         if (newCycle || safeRecovery) progressiveCycleBudgetUsdE8 = _progressiveAssetsUsd();
@@ -352,12 +379,15 @@ contract SecureBotModule {
 
     function continueProgressiveRebalance(uint256 amountIn, uint256 minAmountOut) external {
         _requireCurrentModule();
-        require(progressiveRebalanceStatus == 2 && IProgressiveVault(vault).isRebalancing(), "No progressive");
+        if (progressiveRebalanceStatus != 2 || !IProgressiveVault(vault).isRebalancing()) {
+            revert ProgressiveInactive();
+        }
         _requireProgressiveHfSafe();
+        _requireCurrentProgressivePlan();
         progressiveRebalanceStatus = 3;
         IRangeManagerPostCheck(rangeManager).refreshPriceCache();
         RangeOperations.OptimalSwapParams memory plan = _progressiveSwapParams();
-        require(plan.swapNeeded && amountIn > 0 && amountIn <= plan.amountIn, "Invalid chunk");
+        if (!plan.swapNeeded || amountIn == 0 || amountIn > plan.amountIn) revert InvalidProgressiveChunk();
         _consumeProgressiveSwapBudget(plan.zeroForOne, amountIn);
         IRangeManagerPostCheck rm = IRangeManagerPostCheck(rangeManager);
         address tokenIn = plan.zeroForOne ? rm.token0() : rm.token1();
@@ -368,14 +398,14 @@ contract SecureBotModule {
     }
 
     function getProgressiveSwapParams() external view returns (RangeOperations.OptimalSwapParams memory) {
-        require(progressiveRebalanceStatus == 2, "No progressive");
+        if (progressiveRebalanceStatus != 2) revert ProgressiveInactive();
         return _progressiveSwapParams();
     }
 
     function _progressiveSwapParams() private view returns (RangeOperations.OptimalSwapParams memory) {
         IRangeManagerPostCheck rm = IRangeManagerPostCheck(rangeManager);
         (uint128 p0, uint128 p1, uint160 sqrtP, int24 tick, uint64 timestamp, bool valid) = rm.priceCache();
-        require(valid, "Invalid price");
+        if (!valid) revert InvalidPrice();
         (uint256 balance0, uint256 balance1) = rm.getCurrentBalances();
         return RangeOperations.calculateOptimalSwapParams(
             balance0,
@@ -389,13 +419,16 @@ contract SecureBotModule {
 
     function finalizeProgressiveRebalance(uint256 amountIn, uint256 minAmountOut) external {
         _requireCurrentModule();
-        require(progressiveRebalanceStatus == 2 && IProgressiveVault(vault).isRebalancing(), "No progressive");
+        if (progressiveRebalanceStatus != 2 || !IProgressiveVault(vault).isRebalancing()) {
+            revert ProgressiveInactive();
+        }
         _requireProgressiveHfSafe();
+        _requireCurrentProgressivePlan();
         progressiveRebalanceStatus = 3;
         if (amountIn > 0) {
             IRangeManagerPostCheck(rangeManager).refreshPriceCache();
             RangeOperations.OptimalSwapParams memory plan = _progressiveSwapParams();
-            require(plan.swapNeeded && amountIn <= plan.amountIn, "Invalid chunk");
+            if (!plan.swapNeeded || amountIn > plan.amountIn) revert InvalidProgressiveChunk();
             _consumeProgressiveSwapBudget(plan.zeroForOne, amountIn);
         }
         bytes32 decisionHash = progressiveDecisionHash;
@@ -408,6 +441,7 @@ contract SecureBotModule {
 
     function _clearProgressiveRebalance() private {
         delete progressivePlanEpoch;
+        delete progressivePlanValidUntil;
         delete progressiveCycleBudgetUsdE8;
         delete progressiveTickLower;
         delete progressiveTickUpper;
@@ -418,10 +452,17 @@ contract SecureBotModule {
         progressiveRebalanceStatus = 0;
     }
 
+    function _requireCurrentProgressivePlan() private view {
+        if (block.timestamp > progressivePlanValidUntil) revert ProgressivePlanExpired();
+        if (IRangeStrategyEngine(strategyEngine).previewDecision().epoch != progressivePlanEpoch) {
+            revert ProgressivePlanStale();
+        }
+    }
+
     function _consumeProgressiveSwapBudget(bool zeroForOne, uint256 amountIn) private {
         IRangeManagerPostCheck rm = IRangeManagerPostCheck(rangeManager);
         (uint128 price0, uint128 price1,,,, bool valid) = rm.priceCache();
-        require(valid, "Invalid price");
+        if (!valid) revert InvalidPrice();
         RangeOperations.RangeConfig memory cfg = rm.config();
         uint256 amountUsdE8 = Math.mulDiv(
             amountIn, zeroForOne ? price0 : price1, 10 ** (zeroForOne ? cfg.token0Decimals : cfg.token1Decimals)
@@ -541,7 +582,7 @@ contract SecureBotModule {
 
     modifier onlyBot() {
         require(msg.sender == botAddress, "Only bot allowed");
-        require(!paused, "Module paused");
+        if (paused) revert ModulePaused();
         _requireCurrentModule();
         _;
     }
@@ -553,12 +594,12 @@ contract SecureBotModule {
     }
 
     modifier onlyOwner() {
-        require(msg.sender == owner, "Only owner");
+        if (msg.sender != owner) revert UnauthorizedOwner();
         _;
     }
 
     modifier onlyAllowedFunction(bytes calldata data) {
-        require(data.length >= 4, "Invalid data");
+        if (data.length < 4) revert InvalidCallData();
         bytes4 selector = bytes4(data[:4]);
         require(_allowedFunctions[selector], "Function not allowed");
         _;
@@ -588,7 +629,7 @@ contract SecureBotModule {
     // Fonction existante pour RangeManager
     function executeRangeManagerFunction(bytes calldata data) external onlyBot onlyAllowedFunction(data) {
         bytes4 selector = bytes4(data[:4]);
-        require(selector == REFRESH_PRICE_SELECTOR || selector == REBALANCE_SELECTOR, "Wrong target");
+        if (selector != REFRESH_PRICE_SELECTOR && selector != REBALANCE_SELECTOR) revert InvalidTarget();
         _requireInflowsForSelector(selector);
         if (selector != REFRESH_PRICE_SELECTOR) {
             _consumeDailyLimit();
@@ -603,7 +644,7 @@ contract SecureBotModule {
 
     function executeStrategyEngineFunction(bytes calldata data) external onlyBot onlyAllowedFunction(data) {
         bytes4 selector = bytes4(data[:4]);
-        require(selector == CHECKPOINT_SELECTOR, "Wrong target");
+        if (selector != CHECKPOINT_SELECTOR) revert InvalidTarget();
         _consumeDailyLimit();
         _execute(strategyEngine, 0, data);
         emit FunctionExecuted(selector, dailySpent);
@@ -615,7 +656,7 @@ contract SecureBotModule {
         // la limite quotidienne — sinon un jour de forte activite pourrait laisser le vault verrouille.
         // Toutes les autres fonctions vault (dont startRebalance) restent soumises a la limite.
         bytes4 selector = bytes4(data[:4]);
-        if (selector == END_REBALANCE_SELECTOR) require(progressiveRebalanceStatus == 0, "Progressive active");
+        if (selector == END_REBALANCE_SELECTOR && progressiveRebalanceStatus != 0) revert ProgressiveActive();
         _requireInflowsForSelector(selector);
         if (selector != END_REBALANCE_SELECTOR) {
             _consumeDailyLimit();
@@ -633,12 +674,12 @@ contract SecureBotModule {
     // lui seul contourne la pause. Aucun des deux ne consomme la limite du hot bot.
     function executeHedgeFunction(bytes calldata data) external onlyBotAddress {
         _resetDailyCounterIfNeeded();
-        require(data.length >= 4, "Invalid data");
+        if (data.length < 4) revert InvalidCallData();
         bytes4 selector = bytes4(data[:4]);
-        require(selector == ADJUST_HEDGE_SELECTOR || selector == REPAIR_HF_SELECTOR, "Wrong target");
-        require(data.length == 4, "Invalid data");
+        if (selector != ADJUST_HEDGE_SELECTOR && selector != REPAIR_HF_SELECTOR) revert InvalidTarget();
+        if (data.length != 4) revert InvalidCallData();
         require(_allowedFunctions[selector], "Function not allowed");
-        if (selector == ADJUST_HEDGE_SELECTOR) require(!paused, "Module paused");
+        if (selector == ADJUST_HEDGE_SELECTOR && paused) revert ModulePaused();
         _execute(hedgeManager, 0, data);
 
         emit FunctionExecuted(selector, dailySpent);
@@ -646,7 +687,7 @@ contract SecureBotModule {
 
     /// @notice Execute a Treasury function (bridge operations only, per whitelist)
     function executeTreasuryFunction(bytes calldata data) external onlyBot onlyAllowedFunction(data) withinDailyLimit {
-        require(!paused, "Module paused");
+        if (paused) revert ModulePaused();
         _execute(treasury, 0, data);
 
         bytes4 selector = bytes4(data[:4]);
@@ -662,7 +703,7 @@ contract SecureBotModule {
         onlyAllowedFunction(data)
         withinDailyLimit
     {
-        require(!paused, "Module paused");
+        if (paused) revert ModulePaused();
         require(msg.value == value, "Invalid ETH value");
 
         uint256 nativeBefore = address(this).balance - msg.value;
@@ -700,7 +741,7 @@ contract SecureBotModule {
     /// @notice Pause d'urgence du module.
     /// @dev En Phase 2, owner devient le timelock mais la Safe immutable reste guardian d'urgence.
     function setPaused(bool _paused) external {
-        require(msg.sender == owner || msg.sender == safe, "Only owner");
+        if (msg.sender != owner && msg.sender != safe) revert UnauthorizedOwner();
         if (msg.sender == safe && msg.sender != owner) require(_paused, "Safe pause only");
         paused = _paused;
         emit Paused(_paused);
@@ -727,7 +768,7 @@ contract SecureBotModule {
     }
 
     function sweepNativeToSafe() external {
-        require(msg.sender == owner || msg.sender == safe, "Only owner");
+        if (msg.sender != owner && msg.sender != safe) revert UnauthorizedOwner();
         uint256 amount = address(this).balance;
         require(amount > 0, "No balance");
         (bool ok,) = safe.call{value: amount}("");
@@ -736,7 +777,7 @@ contract SecureBotModule {
     }
 
     function sweepTokenToSafe(address token) external {
-        require(msg.sender == owner || msg.sender == safe, "Only owner");
+        if (msg.sender != owner && msg.sender != safe) revert UnauthorizedOwner();
         uint256 amount = IERC20Sweep(token).balanceOf(address(this));
         require(amount > 0, "No balance");
         _safeTransfer(token, safe, amount);
@@ -809,7 +850,7 @@ contract SecureBotModule {
         if (
             selector == 0x76919a59 // processDepositPermissionless(uint256[],uint256[],address,address)
         ) {
-            require(!paused, "Module paused");
+            if (paused) revert ModulePaused();
             address controller = pauseController;
             // Yul shl order is shl(shift, value): left-align requireInflowsActive().
             assembly ("memory-safe") {

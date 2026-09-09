@@ -283,6 +283,7 @@ contract RangeStrategyEngine is Ownable, ReentrancyGuard, IRangeStrategyEngine {
                 || cfg.maxWidthChangeBps > 10_000 || cfg.transitionCostBps > 1000 || cfg.dnMinStressHfBps < 11_000
                 || cfg.dnMinStressHfBps > 30_000 || cfg.dnHedgeOnlyMinEdgeBps == 0 || cfg.dnHedgeOnlyMinEdgeBps > 5000
                 || cfg.dnMinHedgeDeltaBps == 0 || cfg.dnMinHedgeDeltaBps > 2000
+                || !_hasAlignedHalfWidth(cfg.minHalfRangeTicks, cfg.maxHalfRangeTicks)
         ) revert InvalidConfiguration();
     }
 
@@ -620,8 +621,10 @@ contract RangeStrategyEngine is Ownable, ReentrancyGuard, IRangeStrategyEngine {
         _hedgeSignalSince = hedgeControl.signalSince;
         _hedgeSignalDirection = hedgeControl.direction;
         // Normalize idle token0 through the ordinary hedge lane before considering an LP burn/remint.
-        if (hedgeControl.eligible && hedgeControl.direction == 1 && hedgeControl.driftBps != type(uint256).max
-            && dn.effectiveShortToken0 < int256(dn.debtToken0)) {
+        if (
+            hedgeControl.eligible && hedgeControl.direction == 1 && hedgeControl.driftBps != type(uint256).max
+                && dn.effectiveShortToken0 < int256(dn.debtToken0)
+        ) {
             _hedgeRecoverySince = 0;
             decision.action = Action.HEDGE_ONLY;
             decision.reason = ReasonCode.HEDGE_DRIFT;
@@ -932,7 +935,7 @@ contract RangeStrategyEngine is Ownable, ReentrancyGuard, IRangeStrategyEngine {
         uint256 minimum = uint256(uint24(_strategyTickSpacing)) * 5;
         if (
             minHalf < minimum || maxHalf <= minHalf || maxHalf > 5000 || fallbackUp < minHalf || fallbackUp > maxHalf
-                || fallbackDown < minHalf || fallbackDown > maxHalf
+                || fallbackDown < minHalf || fallbackDown > maxHalf || !_hasAlignedHalfWidth(minHalf, maxHalf)
         ) revert InvalidConfiguration();
         strategyConfig.fallbackRangeUpTicks = fallbackUp;
         strategyConfig.fallbackRangeDownTicks = fallbackDown;
@@ -949,6 +952,13 @@ contract RangeStrategyEngine is Ownable, ReentrancyGuard, IRangeStrategyEngine {
         strategyConfig.dnHedgeOnlyMinEdgeBps = hedgeOnlyMinEdgeBps;
         strategyConfig.dnMinHedgeDeltaBps = minHedgeDeltaBps;
         emit DnHedgePolicyUpdated(hedgeOnlyMinEdgeBps, minHedgeDeltaBps);
+    }
+
+    function _hasAlignedHalfWidth(uint16 minHalf, uint16 maxHalf) private view returns (bool) {
+        uint256 spacing = uint256(uint24(_strategyTickSpacing));
+        uint256 alignedMin = (uint256(minHalf) + spacing - 1) / spacing * spacing;
+        uint256 alignedMax = uint256(maxHalf) / spacing * spacing;
+        return alignedMin <= alignedMax;
     }
 
     function _clampInt24(int256 value) private pure returns (int24) {

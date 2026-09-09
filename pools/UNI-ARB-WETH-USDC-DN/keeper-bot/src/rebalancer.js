@@ -1,6 +1,32 @@
 // SPDX-License-Identifier: MIT
 
 const USD_SCALE = 100_000_000n;
+const PARTIAL_FILL_SELECTOR = '0xd964f528';
+
+function isProgressiveChunkLimitError(error) {
+  const pending = [error];
+  const seen = new Set();
+  let inspected = 0;
+  while (pending.length > 0 && inspected < 64) {
+    const value = pending.shift();
+    if (value === null || value === undefined) continue;
+    if (typeof value === 'string') {
+      const text = value.toLowerCase();
+      if (
+        text.startsWith(PARTIAL_FILL_SELECTOR)
+        || /too little received|partial\s*fill|sqrt|price limit|\bspl\b/i.test(text)
+      ) return true;
+      continue;
+    }
+    if (typeof value !== 'object' || seen.has(value)) continue;
+    seen.add(value);
+    inspected++;
+    for (const key of ['shortMessage', 'reason', 'message', 'data', 'error', 'info', 'cause', 'revert']) {
+      if (Object.prototype.hasOwnProperty.call(value, key)) pending.push(value[key]);
+    }
+  }
+  return false;
+}
 const DN_MAX_DEPOSIT_SWAP_CHUNKS = 10n;
 
 function ceilDiv(value, divisor) {
@@ -456,6 +482,9 @@ class Rebalancer {
 
   async _runProgressiveRebalance(expectedDecisionHash = null) {
     const txHashes = [];
+    const receipts = [];
+    let swapsExecuted = 0;
+    let completedElsewhere = false;
     await this._maybeRefreshProgressiveTarget(txHashes);
     let status = await this.getProgressiveRebalanceStatus();
 
@@ -465,17 +494,24 @@ class Rebalancer {
       const receipt = await this._sendProgressiveTransaction(
         'beginProgressiveRebalance', [expectedDecisionHash], 'beginProgressiveRebalance'
       );
-      txHashes.push(receipt.hash);
+      if (receipt) {
+        receipts.push(receipt);
+        txHashes.push(receipt.hash || receipt.transactionHash);
+      }
       status = await this.getProgressiveRebalanceStatus();
     }
-    if (status !== 2) throw new Error(`unexpected progressive DN rebalance state: ${status}`);
+    if (status === 0) completedElsewhere = true;
+    if (status !== 0 && status !== 2) throw new Error(`unexpected progressive DN rebalance state: ${status}`);
 
     let staleRetries = 0;
-    while (true) {
+    while (!completedElsewhere) {
       if (this.beforeProgressiveStep) await this.beforeProgressiveStep();
       await this._maybeRefreshProgressiveTarget(txHashes);
       const state = await this._readProgressivePlan();
-      if (state.status === 0) break;
+      if (state.status === 0) {
+        completedElsewhere = true;
+        break;
+      }
       if (state.status !== 2) throw new Error(`non-executable progressive DN rebalance state: ${state.status}`);
 
       const swapNeeded = Boolean(state.plan.swapNeeded);
@@ -485,7 +521,14 @@ class Rebalancer {
         const receipt = await this._sendProgressiveTransaction(
           'finalizeProgressiveRebalance', [0n, 0n], 'finalizeProgressiveRebalance'
         );
-        txHashes.push(receipt.hash);
+        if (receipt) {
+          receipts.push(receipt);
+          txHashes.push(receipt.hash || receipt.transactionHash);
+        } else if (await this.getProgressiveRebalanceStatus() === 0) {
+          completedElsewhere = true;
+        } else {
+          throw new Error('progressive DN finalization returned no receipt and no final state');
+        }
         break;
       }
 
@@ -507,6 +550,9 @@ class Rebalancer {
         const method = finalize ? 'finalizeProgressiveRebalance' : 'continueProgressiveRebalance';
         try {
           receipt = await this._sendProgressiveTransaction(method, [amountIn, minOut], method);
+          if (!receipt && await this.getProgressiveRebalanceStatus() === 0) {
+            completedElsewhere = true;
+          }
           break;
         } catch (error) {
           const text = this._errorText(error).toLowerCase();
@@ -515,7 +561,7 @@ class Rebalancer {
             refreshRequested = true;
             break;
           }
-          if (['partialfill', 'partial fill', 'sqrt', 'price limit', 'spl'].some((marker) => text.includes(marker)) && amountIn > 1n) {
+          if (isProgressiveChunkLimitError(error) && amountIn > 1n) {
             amountIn /= 2n;
             finalize = false;
             console.log(`  Price-impact bound reached; retrying a smaller DN chunk (${amountIn})`);
@@ -532,15 +578,26 @@ class Rebalancer {
       }
 
       if (!receipt) {
+        if (completedElsewhere) break;
         if (refreshRequested) continue;
         throw new Error('unable to produce an executable progressive DN chunk');
       }
       staleRetries = 0;
-      txHashes.push(receipt.hash);
+      receipts.push(receipt);
+      txHashes.push(receipt.hash || receipt.transactionHash);
+      swapsExecuted += 1;
       if (finalize) break;
     }
 
-    return { success: true, progressive: true, txHashes };
+    return {
+      success: true,
+      progressive: true,
+      txHashes,
+      receipts,
+      finalReceipt: receipts[receipts.length - 1] || null,
+      swapsExecuted,
+      completedElsewhere,
+    };
   }
 
   async resumeProgressiveRebalanceIfActive() {
@@ -630,4 +687,4 @@ class Rebalancer {
   }
 }
 
-module.exports = { Rebalancer, calculateChunkPlan, divideIntoChunks };
+module.exports = { Rebalancer, calculateChunkPlan, divideIntoChunks, isProgressiveChunkLimitError };

@@ -71,11 +71,11 @@ function sanitizeRpcError(error) {
 
 class RPCPool {
   constructor() {
-    const urls = [
+    const urls = [...new Set([
       process.env.RPC_URL,
       process.env.RPC_BACKUP_1,
       process.env.RPC_BACKUP_2
-    ].filter(Boolean);
+    ].filter(Boolean))];
 
     if (urls.length === 0) throw new Error('No RPC URL configured');
 
@@ -94,6 +94,8 @@ class RPCPool {
       : null;
     this.signerAddress = this.signerWallet?.address.toLowerCase() || null;
     this.maxGasPriceWei = readPositiveGweiEnv('KEEPER_MAX_GAS_PRICE_GWEI');
+    this.emergencyMaxGasPriceWei = this.maxGasPriceWei ? this.maxGasPriceWei * 2n : null;
+    this.emergencyMaxGasLimit = 4_000_000n;
     const configuredHfRepairTarget = String(process.env.AAVE_HEDGE_MANAGER_ADDRESS || '').trim();
     if (configuredHfRepairTarget && !ethers.isAddress(configuredHfRepairTarget)) {
       throw new Error('AAVE_HEDGE_MANAGER_ADDRESS must be a valid address');
@@ -308,6 +310,7 @@ class RPCPool {
       ) {
         throw new Error('Persisted keeper fee-cap exemption is not bound to repairHealthFactor()');
       }
+      this._assertEmergencyFeeCap(rawTransaction, 'Persisted HF_REPAIR');
     }
     return parsed;
   }
@@ -464,6 +467,39 @@ class RPCPool {
     throw sanitizeRpcError(lastError);
   }
 
+  async executeConsensusRead(fn, keyOf, label = 'keeper critical read') {
+    if (typeof keyOf !== 'function') throw new Error(`${label}: consensus key function is required`);
+    const entries = await this._authenticatedProviderEntries();
+    const observations = await Promise.all(entries.map(async (entry) => {
+      try {
+        const value = await this.withTimeout(
+          () => fn(entry.provider),
+          RPC_READ_TIMEOUT_MS,
+          label
+        );
+        const key = String(keyOf(value));
+        if (!key) throw new Error('empty consensus key');
+        return { key, value };
+      } catch (_) {
+        return null;
+      }
+    }));
+    const successfulObservations = observations.filter(Boolean);
+    // Preserve the supported one-RPC mode when every other independently configured
+    // endpoint is unavailable, while still rejecting any live disagreement.
+    const quorum = successfulObservations.length === 1 ? 1 : 2;
+    const groups = new Map();
+    for (const observation of successfulObservations) {
+      const group = groups.get(observation.key) || { count: 0, value: observation.value };
+      group.count++;
+      groups.set(observation.key, group);
+      if (group.count >= quorum) return group.value;
+    }
+    const error = new Error(`${label}: RPC read quorum ${quorum}/${this.providers.length} unavailable or inconsistent`);
+    error.code = 'RPC_READ_QUORUM_UNAVAILABLE';
+    throw error;
+  }
+
   async _latestSignerNonce() {
     const entries = await this._authenticatedProviderEntries();
     const counts = new Map();
@@ -485,6 +521,63 @@ class RPCPool {
     return confirmed.length > 0 ? Math.max(...confirmed) : null;
   }
 
+  _receiptQuorumSize(validReceiptCount) {
+    return validReceiptCount === 1 ? 1 : 2;
+  }
+
+  async _readReceiptQuorum(entries, txHash, label) {
+    const receipts = await Promise.all(entries.map((entry) => this.withTimeout(
+      () => entry.provider.getTransactionReceipt(txHash),
+      RPC_READ_TIMEOUT_MS,
+      `${label} receipt quorum`
+    ).catch(() => null)));
+    const groups = new Map();
+    let validReceiptCount = 0;
+    for (const receipt of receipts) {
+      if (!receipt) continue;
+      const hash = String(receipt.hash || receipt.transactionHash || '').toLowerCase();
+      const blockHash = String(receipt.blockHash || '').toLowerCase();
+      const blockNumber = Number(receipt.blockNumber);
+      if (hash !== String(txHash).toLowerCase() || !Number.isSafeInteger(blockNumber)) continue;
+      if (!/^0x[0-9a-f]{64}$/.test(blockHash)) continue;
+      validReceiptCount++;
+      const key = `${hash}:${blockHash}:${blockNumber}:${Number(receipt.status)}`;
+      const group = groups.get(key) || { count: 0, receipt };
+      group.count++;
+      groups.set(key, group);
+    }
+    const quorum = this._receiptQuorumSize(validReceiptCount);
+    const confirmed = [...groups.values()].filter((group) => group.count >= quorum);
+    return confirmed.length === 1 ? confirmed[0].receipt : null;
+  }
+
+  async _signingNonce() {
+    const entries = await this._authenticatedProviderEntries();
+    const counts = new Map();
+    for (const entry of entries) {
+      const nonce = await this.withTimeout(
+        () => entry.provider.getTransactionCount(this.signerAddress, 'pending'),
+        RPC_READ_TIMEOUT_MS,
+        'keeper signing nonce quorum'
+      ).catch(() => null);
+      if (nonce !== null && Number.isSafeInteger(Number(nonce))) {
+        const value = Number(nonce);
+        counts.set(value, (counts.get(value) || 0) + 1);
+      }
+    }
+    const successfulResponses = [...counts.values()].reduce((total, count) => total + count, 0);
+    // One surviving authenticated RPC is equivalent to the explicitly supported
+    // single-RPC deployment. Two live but divergent RPCs still fail closed.
+    const quorum = successfulResponses === 1 ? 1 : 2;
+    const confirmed = [...counts.entries()].filter(([, count]) => count >= quorum).map(([nonce]) => nonce);
+    if (confirmed.length !== 1) {
+      const error = new Error(`Keeper signing nonce quorum ${quorum}/${this.providers.length} unavailable`);
+      error.code = 'RPC_SIGNING_NONCE_QUORUM_UNAVAILABLE';
+      throw error;
+    }
+    return confirmed[0];
+  }
+
   _assertFeeCap(transaction, label) {
     if (!this.maxGasPriceWei) throw new Error('KEEPER_MAX_GAS_PRICE_GWEI is not configured');
     for (const [field, value] of [
@@ -498,6 +591,26 @@ class RPCPool {
           `above KEEPER_MAX_GAS_PRICE_GWEI=${ethers.formatUnits(this.maxGasPriceWei, 'gwei')}`
         );
       }
+    }
+  }
+
+  _assertEmergencyFeeCap(transaction, label) {
+    const emergencyMaxGasPriceWei = this.emergencyMaxGasPriceWei
+      || (this.maxGasPriceWei ? this.maxGasPriceWei * 2n : null);
+    const emergencyMaxGasLimit = this.emergencyMaxGasLimit || 4_000_000n;
+    if (!emergencyMaxGasPriceWei) {
+      throw new Error('KEEPER_MAX_GAS_PRICE_GWEI is required for the emergency fee ceiling');
+    }
+    const gasLimit = BigInt(transaction?.gasLimit || 0n);
+    if (gasLimit === 0n || gasLimit > emergencyMaxGasLimit) {
+      throw new Error(`${label}: emergency gasLimit ${gasLimit} exceeds ${emergencyMaxGasLimit}`);
+    }
+    const feeFields = [transaction?.gasPrice, transaction?.maxFeePerGas, transaction?.maxPriorityFeePerGas]
+      .filter((value) => value !== null && value !== undefined);
+    if (feeFields.length === 0 || feeFields.some((value) => BigInt(value) > emergencyMaxGasPriceWei)) {
+      throw new Error(
+        `${label}: emergency gas fee exceeds ${ethers.formatUnits(emergencyMaxGasPriceWei, 'gwei')} gwei`
+      );
     }
   }
 
@@ -516,7 +629,8 @@ class RPCPool {
     if (!this._isConfiguredHfRepairTransaction(transaction)) {
       throw new Error(`${label}: fee-cap exemption is restricted to configured repairHealthFactor()`);
     }
-    console.warn(`${label}: critical HF_REPAIR bypasses KEEPER_MAX_GAS_PRICE_GWEI`);
+    this._assertEmergencyFeeCap(transaction, label);
+    console.warn(`${label}: critical HF_REPAIR uses a finite emergency gas ceiling`);
     return true;
   }
 
@@ -526,6 +640,7 @@ class RPCPool {
       message.includes('transaction underpriced') ||
       message.includes('fee too low') ||
       message.includes('receipt pending after') ||
+      message.includes('receipt timeout after') ||
       message.includes('receipt unavailable');
   }
 
@@ -580,7 +695,8 @@ class RPCPool {
       ) {
         throw new Error(`${pending.label}: invalid persisted HF_REPAIR fee-cap exemption`);
       }
-      console.warn(`${pending.label} replacement: critical HF_REPAIR bypasses the fee cap`);
+      this._assertEmergencyFeeCap(request, `${pending.label} replacement`);
+      console.warn(`${pending.label} replacement: critical HF_REPAIR uses the emergency gas ceiling`);
     } else {
       this._assertFeeCap(request, `${pending.label} replacement`);
     }
@@ -611,20 +727,14 @@ class RPCPool {
     );
 
     const entries = await this._authenticatedProviderEntries();
-    for (const entry of entries) {
-      const receipt = await this.withTimeout(
-        () => entry.provider.getTransactionReceipt(pending.txHash),
-        RPC_READ_TIMEOUT_MS,
-        'persisted keeper receipt lookup'
-      ).catch(() => null);
-      if (receipt) {
-        this._clearPersistedSignedTx(pending.txHash);
-        return {
-          status: receipt.status === 1 ? 'confirmed' : 'failed',
-          receipt,
-          ...pending,
-        };
-      }
+    const confirmedReceipt = await this._readReceiptQuorum(entries, pending.txHash, 'persisted keeper');
+    if (confirmedReceipt) {
+      this._clearPersistedSignedTx(pending.txHash);
+      return {
+        status: confirmedReceipt.status === 1 ? 'confirmed' : 'failed',
+        receipt: confirmedReceipt,
+        ...pending,
+      };
     }
 
     const latestNonceBefore = await this._latestSignerNonce();
@@ -698,6 +808,8 @@ class RPCPool {
       ].reduce((highest, value) => value > highest ? value : highest, 0n);
     }
 
+    this._assertEmergencyFeeCap(request, `${label} critical preemption`);
+
     const replacementRaw = await this.withTimeout(
       () => { this._assertSignerLock(); return prepared.wallet.signTransaction(request); }, RPC_TX_TIMEOUT_MS, `${label} critical preemption signing`
     );
@@ -748,33 +860,26 @@ class RPCPool {
     const provider = this.getProvider();
     await this._ensureSignerState(provider);
     return await this._withSignerLock(provider, async () => {
-      const prepareBundle = async () => await this.executeWithRetry(async (currentProvider) => {
+      const prepareBundle = async () => {
+        const signingNonce = await this._signingNonce();
+        return await this.executeWithRetry(async (currentProvider) => {
         const prepared = await prepareFn(currentProvider);
         if (!prepared?.wallet || !prepared?.request) {
           throw new Error(`${label}: prepareFn must return { wallet, request }`);
         }
         const populated = await prepared.wallet.populateTransaction(prepared.request);
+        populated.nonce = signingNonce;
         const feeCapExempt = this._applyFeeCapPolicy(populated, label, bypassFeeCap === true);
         return { provider: currentProvider, prepared, populated, feeCapExempt };
-      }, maxRetries, RPC_TX_TIMEOUT_MS);
+        }, maxRetries, RPC_TX_TIMEOUT_MS);
+      };
 
       let preparedBundle = null;
       if (bypassFeeCap === true) {
         const pending = this._readPendingSignedTx();
         if (pending) {
           const entries = await this._authenticatedProviderEntries();
-          let settled = false;
-          for (const entry of entries) {
-            const receipt = await this.withTimeout(
-              () => entry.provider.getTransactionReceipt(pending.txHash),
-              RPC_READ_TIMEOUT_MS,
-              'critical preemption receipt lookup'
-            ).catch(() => null);
-            if (receipt) {
-              settled = true;
-              break;
-            }
-          }
+          let settled = !!await this._readReceiptQuorum(entries, pending.txHash, 'critical preemption');
           if (!settled) {
             const latestNonce = await this._latestSignerNonce();
             settled = latestNonce !== null && latestNonce > pending.nonce;
@@ -847,73 +952,45 @@ class RPCPool {
       0,
       entries.findIndex((entry) => entry.provider === preferredProvider)
     );
-    const attempts = Math.max(maxRetries, entries.length);
+    const orderedEntries = entries.map((_, offset) => (
+      entries[(authenticatedStartIndex + offset) % entries.length]
+    ));
     let lastError = null;
 
-    for (let attempt = 1; attempt <= attempts; attempt++) {
-      const entry = entries[(authenticatedStartIndex + attempt - 1) % entries.length];
-      const provider = entry.provider;
-      try {
-        const existing = await this.withTimeout(
-          () => provider.getTransactionReceipt(txHash), RPC_READ_TIMEOUT_MS, `${label} receipt lookup`
-        );
-        if (existing) {
-          if (existing.status !== 1) throw new Error(`${label} failed on-chain: ${txHash}`);
-          return existing;
-        }
-
-        try {
-          await this.withTimeout(
-            () => { this._assertSignerLock(); return provider.broadcastTransaction(signedTx); }, RPC_READ_TIMEOUT_MS, `${label} broadcast`
-          );
-          console.log(`${label} raw tx ${attempt === 1 ? 'broadcast' : 'rebroadcast'}: ${txHash}`);
-        } catch (error) {
-          if (!this.isAlreadyKnownTx(error)) throw error;
-        }
-
-        const receipt = await this.withTimeout(
-          () => provider.waitForTransaction(txHash, 1, 60_000), RPC_TX_TIMEOUT_MS, `${label} receipt wait`
-        );
-        if (receipt) {
-          if (receipt.status !== 1) throw new Error(`${label} failed on-chain: ${txHash}`);
-          return receipt;
-        }
-        const pendingError = new Error(`${label} receipt pending after signed broadcast: ${txHash}`);
-        pendingError.code = 'TIMEOUT';
-        throw pendingError;
-      } catch (error) {
-        const receipt = await this.withTimeout(
-          () => provider.getTransactionReceipt(txHash), RPC_READ_TIMEOUT_MS, `${label} receipt reconciliation`
-        ).catch(() => null);
-        if (receipt) {
-          if (receipt.status !== 1) throw new Error(`${label} failed on-chain: ${txHash}`);
-          return receipt;
-        }
-        const providerError = this.isProviderError(error);
-        const consumedNonce = this.isConsumedNonceError(error);
-        if (!providerError && !this.isAlreadyKnownTx(error) && !consumedNonce) {
-          error = sanitizeRpcError(error);
-          error.message = `${safeErrorMessage(error)} (signed tx: ${txHash})`;
-          throw error;
-        }
-        lastError = error;
-        if (providerError) this.markUnhealthy(provider, true);
-        console.warn(`RPC signed tx attempt ${attempt}/${attempts} failed: ${safeErrorMessage(error)}`);
-      }
+    const existing = await this._readReceiptQuorum(entries, txHash, `${label} pre-broadcast`);
+    if (existing) {
+      if (existing.status !== 1) throw new Error(`${label} failed on-chain: ${txHash}`);
+      return existing;
     }
 
-    // One final sequential reconciliation across the configured tier. No provider
-    // outside this RPCPool is ever introduced by the signed transaction path.
-    for (const entry of entries) {
-      const receipt = await this.withTimeout(
-        () => entry.provider.getTransactionReceipt(txHash), RPC_READ_TIMEOUT_MS, `${label} final receipt reconciliation`
-      ).catch(() => null);
+    await Promise.all(orderedEntries.map(async (entry, index) => {
+      try {
+        await this.withTimeout(
+          () => { this._assertSignerLock(); return entry.provider.broadcastTransaction(signedTx); },
+          RPC_READ_TIMEOUT_MS,
+          `${label} broadcast`
+        );
+        console.log(`${label} raw tx ${index === 0 ? 'broadcast' : 'rebroadcast'}: ${txHash}`);
+      } catch (error) {
+        if (!this.isAlreadyKnownTx(error)) {
+          lastError = error;
+          if (this.isProviderError(error)) this.markUnhealthy(entry.provider, true);
+          console.warn(`RPC signed tx broadcast ${index + 1}/${orderedEntries.length} failed: ${safeErrorMessage(error)}`);
+        }
+      }
+    }));
+
+    const configuredRetries = Number.isInteger(maxRetries) && maxRetries > 0 ? maxRetries : 3;
+    const rounds = Math.max(3, Math.min(12, configuredRetries * 2));
+    for (let round = 0; round < rounds; round++) {
+      const receipt = await this._readReceiptQuorum(entries, txHash, `${label} reconciliation`);
       if (receipt) {
         if (receipt.status !== 1) throw new Error(`${label} failed on-chain: ${txHash}`);
         return receipt;
       }
+      if (round + 1 < rounds) await new Promise((resolve) => setTimeout(resolve, 10_000));
     }
-    const error = lastError || new Error(`${label} receipt unavailable`);
+    const error = lastError || new Error(`${label} receipt pending after signed broadcast`);
     error.message = `${safeErrorMessage(error)} (signed tx: ${txHash})`;
     throw sanitizeRpcError(error);
   }
